@@ -1,0 +1,7 @@
+# ZED SDK 4.x/5.x must be installed separately (it provides the pyzed package):
+#   run "python get_python_api.py" from the ZED SDK install folder.
+# FFmpeg (ffmpeg + ffprobe) must be on PATH for the live .mkv output and verification.
+numpy
+opencv-python
+pillow
+pydub        # only used for sounds on non-Windows systems
