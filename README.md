@@ -10,6 +10,9 @@ report anything that goes wrong.
 | `Zed2i_video_datacollection.py` | GUI recorder (run this in the field) |
 | `extract_svo.py` | Recompute depth from the SVO2 file and export frames, depth, confidence, poses, point clouds, or a gap-free `.mkv` set |
 | `verify_session.py` | Check a session after recording (frame counts, gaps, CRCs, checksums for backups) |
+| `record_headless.py` | Terminal recorder (same data as the GUI) for SSH / no monitor, e.g. on a Jetson |
+| `zed_doctor.py` | Checks the machine, USB 3 link, disk and SDK; pre-builds NEURAL models; benchmarks loss-free settings |
+| `jetson/` | `setup_jetson.sh` (one-time setup) and `run_weedscan.sh` (desktop launcher). See **JETSON.md** |
 | `session_reader.py` | Standalone Python reader for sessions (numpy + ffmpeg): decoding, joins, backprojection, world transform |
 | `DATA_SPEC.md` | **Full data specification**: every file, format, code and column, plus guidance for extraction and localization |
 | `video.py` | Older script, kept for reference |

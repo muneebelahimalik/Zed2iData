@@ -60,19 +60,32 @@ from PIL import Image, ImageTk
 import pyzed.sl as sl
 
 APP_NAME = "WeedScan ZED 2i Data Collection"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_WINDOWS = os.name == "nt"
+IS_JETSON = os.path.exists("/etc/nv_tegra_release") or "tegra" in platform.release().lower()
 
 ###############################################################################
 # Configuration
 ###############################################################################
 
+# Per-machine settings (paths, defaults) can be overridden WITHOUT editing this file:
+# put any of the keys below into config_local.json next to this script.
 CONFIG = {
-    "base_directory": "M:/Research/Data/Vidalia_onions_visit2_day2",
-    "wave_start_path": "C:/Users/mm17889/Zed2iData/working.wav",
-    "wave_stop_path": "C:/Users/mm17889/Zed2iData/save.wav",
+    "base_directory": ("M:/Research/Data/Vidalia_onions_visit2_day2" if IS_WINDOWS
+                       else os.path.expanduser("~/ZED_Data/Vidalia_onions")),
+    "wave_start_path": ("C:/Users/mm17889/Zed2iData/working.wav" if IS_WINDOWS
+                        else os.path.join(SCRIPT_DIR, "working.wav")),
+    "wave_stop_path": ("C:/Users/mm17889/Zed2iData/save.wav" if IS_WINDOWS
+                       else os.path.join(SCRIPT_DIR, "save.wav")),
 
     "default_resolution": "HD2K (2208x1242)",
-    "default_depth_mode": "NEURAL",
+    # Jetson: the CPU cannot encode live FFV1 at HD2K and the GPU is shared with the
+    # SVO pipeline, so record the lossless SVO2 only and use the light depth model
+    # for preview / speed. Full-quality depth is recomputed offline from the SVO2.
+    "default_depth_mode": "NEURAL_LIGHT" if IS_JETSON else "NEURAL",
+    "default_record_mkv": not IS_JETSON,
 
     # Depth / confidence storage in the live .mkv files.
     "depth_units_per_mm": 10,      # 10 -> 0.1 mm per unit, max encodable 6553.3 mm
@@ -105,6 +118,24 @@ CONFIG = {
     "default_min_views": 20,
     "default_beep_spacing_m": 0.5,
 }
+
+
+
+def _load_local_config() -> None:
+    path = os.path.join(SCRIPT_DIR, "config_local.json")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            local = json.load(f)
+        unknown = [k for k in local if k not in CONFIG]
+        CONFIG.update({k: v for k, v in local.items() if k in CONFIG})
+        print(f"[INFO] loaded {path}" + (f" (ignored unknown keys {unknown})" if unknown else ""))
+    except Exception as e:
+        print(f"[WARN] could not read {path}: {e}")
+
+
+_load_local_config()
 
 # Allowed (resolution -> fps) combinations for the ZED 2i.
 RESOLUTIONS = {
@@ -243,15 +274,31 @@ def popen_hidden_kwargs() -> dict:
     return {}
 
 
+def _linux_play(path: str) -> bool:
+    """Play a WAV on Linux with whatever player exists (aplay ships with Jetson images)."""
+    for player in (["paplay", path], ["aplay", "-q", path],
+                   ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]):
+        if shutil.which(player[0]):
+            try:
+                subprocess.run(player, timeout=10, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                continue
+    return False
+
+
 def play_wav_async(wav_path: str) -> None:
     def _play():
         if not wav_path or not os.path.exists(wav_path):
+            # no sound file on this machine -> distinctive double beep instead
+            beep_async(900, 120)
             return
         try:
-            if os.name == "nt":
+            if IS_WINDOWS:
                 import winsound
                 winsound.PlaySound(wav_path, winsound.SND_FILENAME)
-            else:
+            elif not _linux_play(wav_path):
                 from pydub import AudioSegment
                 from pydub.playback import play
                 play(AudioSegment.from_wav(wav_path))
@@ -260,13 +307,36 @@ def play_wav_async(wav_path: str) -> None:
     threading.Thread(target=_play, daemon=True).start()
 
 
+_TONE_CACHE = {}
+
+
+def _tone_wav(freq: int, dur_ms: int) -> str:
+    """Write (once) a short sine-tone WAV to the temp dir and return its path."""
+    key = (freq, dur_ms)
+    if key not in _TONE_CACHE:
+        import tempfile
+        import wave
+        rate = 22050
+        t = np.arange(int(rate * dur_ms / 1000)) / rate
+        ramp = np.minimum(1.0, np.minimum(t, t[::-1]) * 200)  # 5 ms fade, no clicks
+        pcm = (np.sin(2 * np.pi * freq * t) * ramp * 0.6 * 32767).astype("<i2")
+        path = os.path.join(tempfile.gettempdir(), f"weedscan_tone_{freq}_{dur_ms}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm.tobytes())
+        _TONE_CACHE[key] = path
+    return _TONE_CACHE[key]
+
+
 def beep_async(freq: int = 1200, dur_ms: int = 80) -> None:
     def _beep():
         try:
-            if os.name == "nt":
+            if IS_WINDOWS:
                 import winsound
                 winsound.Beep(freq, dur_ms)
-            else:
+            elif not _linux_play(_tone_wav(freq, dur_ms)):
                 sys.stdout.write("\a")
                 sys.stdout.flush()
         except Exception:
@@ -274,27 +344,53 @@ def beep_async(freq: int = 1200, dur_ms: int = 80) -> None:
     threading.Thread(target=_beep, daemon=True).start()
 
 
+_INHIBITOR = {"proc": None}
+
+
 def keep_system_awake(enable: bool) -> None:
-    """Stop Windows from sleeping / blanking the screen while recording."""
-    if os.name != "nt":
+    """Stop the OS from sleeping / blanking the screen while recording."""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x1, 0x2
+            flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED if enable else 0)
+            ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        except Exception:
+            pass
         return
-    try:
-        import ctypes
-        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x1, 0x2
-        flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED if enable else 0)
-        ctypes.windll.kernel32.SetThreadExecutionState(flags)
-    except Exception:
-        pass
+    # Linux / Jetson: hold a systemd inhibitor lock and stop X screen blanking.
+    if enable and _INHIBITOR["proc"] is None and shutil.which("systemd-inhibit"):
+        try:
+            _INHIBITOR["proc"] = subprocess.Popen(
+                ["systemd-inhibit", "--what=idle:sleep:handle-lid-switch", "--who=WeedScan",
+                 "--why=ZED recording in progress", "--mode=block", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    elif not enable and _INHIBITOR["proc"] is not None:
+        try:
+            _INHIBITOR["proc"].terminate()
+        except Exception:
+            pass
+        _INHIBITOR["proc"] = None
+    if os.environ.get("DISPLAY") and shutil.which("xset"):
+        args = ["s", "off", "-dpms"] if enable else ["s", "on", "+dpms"]
+        try:
+            subprocess.run(["xset", *args], timeout=3, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
 
 def raise_process_priority() -> None:
-    if os.name != "nt":
-        return
     try:
-        import ctypes
-        HIGH_PRIORITY_CLASS = 0x80
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(),
-                                                HIGH_PRIORITY_CLASS)
+        if IS_WINDOWS:
+            import ctypes
+            HIGH_PRIORITY_CLASS = 0x80
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(),
+                                                    HIGH_PRIORITY_CLASS)
+        else:
+            os.nice(-5)  # only works with CAP_SYS_NICE / root; harmless otherwise
     except Exception:
         pass
 
@@ -1218,6 +1314,190 @@ class CaptureEngine(threading.Thread):
                            "current_fps": safe(lambda: self.zed.get_current_fps())}
 
 
+
+###############################################################################
+# Shared camera / session operations (used by the GUI and record_headless.py)
+###############################################################################
+
+
+def open_zed(zed, res_name: str, fps: int, depth_choice: str, tracking: bool):
+    """Open the camera with the dataset's fixed parameters.
+
+    Returns (ok, message, runtime_params, open_params, tracking_ok, warnings).
+    """
+    depth_enabled = not depth_choice.startswith("NONE")
+    tracking = tracking and depth_enabled
+    ip = sl.InitParameters()
+    ip.camera_resolution = getattr(sl.RESOLUTION, res_name)
+    ip.camera_fps = fps
+    ip.depth_mode = getattr(sl.DEPTH_MODE, depth_choice) if depth_enabled else sl.DEPTH_MODE.NONE
+    ip.coordinate_units = sl.UNIT.MILLIMETER
+    ip.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
+    # AUTO flip uses the IMU at open(); a downward-looking camera can come out
+    # randomly flipped between sessions. Force a fixed orientation.
+    safe(lambda: setattr(ip, "camera_image_flip", sl.FLIP_MODE.OFF))
+    safe(lambda: setattr(ip, "depth_stabilization", int(CONFIG["depth_stabilization"])))
+    ip.depth_minimum_distance = -1  # SDK default minimum (~300 mm for ZED 2i)
+
+    err = zed.open(ip)
+    if err != sl.ERROR_CODE.SUCCESS:
+        hint = ""
+        if "NOT_DETECTED" in str(err) or "DETECTION" in str(err):
+            hint = ("\nCheck the USB 3 cable/port (run zed_doctor.py) and that no other "
+                    "program (ZED Explorer, Depth Viewer) is using the camera.")
+        return False, f"{err}{hint}", None, None, False, []
+
+    warnings = []
+    cfg = zed.get_camera_information().camera_configuration
+    if cfg.fps != fps or cfg.resolution.width <= 0:
+        warnings.append(f"Camera opened at {cfg.resolution.width}x{cfg.resolution.height}"
+                        f"@{cfg.fps} (requested {fps}).")
+
+    tracking_ok = False
+    if tracking:
+        tp = sl.PositionalTrackingParameters()
+        safe(lambda: setattr(tp, "enable_imu_fusion", True))
+        safe(lambda: setattr(tp, "set_gravity_as_origin", True))
+        terr = zed.enable_positional_tracking(tp)
+        tracking_ok = terr == sl.ERROR_CODE.SUCCESS
+        if not tracking_ok:
+            warnings.append(f"Positional tracking unavailable ({terr}); speed will not be shown.")
+
+    rt = sl.RuntimeParameters()
+    rt.enable_depth = depth_enabled
+    safe(lambda: setattr(rt, "confidence_threshold", CONFIG["confidence_threshold"]))
+    safe(lambda: setattr(rt, "texture_confidence_threshold", CONFIG["texture_confidence_threshold"]))
+    safe(lambda: setattr(rt, "enable_fill_mode", CONFIG["enable_fill_mode"]))
+    safe(lambda: setattr(rt, "measure3D_reference_frame", sl.REFERENCE_FRAME.CAMERA))
+
+    open_params = {
+        "resolution": res_name, "fps": cfg.fps,
+        "width": cfg.resolution.width, "height": cfg.resolution.height,
+        "depth_mode": depth_choice if depth_enabled else "NONE",
+        "depth_enabled": depth_enabled, "positional_tracking": tracking_ok,
+        "init_parameters": {
+            "coordinate_units": "MILLIMETER", "coordinate_system": "IMAGE",
+            "camera_image_flip": safe(lambda: enum_name(ip.camera_image_flip)),
+            "depth_stabilization": safe(lambda: ip.depth_stabilization),
+            "depth_minimum_distance": safe(lambda: ip.depth_minimum_distance),
+            "depth_maximum_distance": safe(lambda: ip.depth_maximum_distance),
+            "enable_image_enhancement": safe(lambda: ip.enable_image_enhancement),
+        },
+        "runtime_parameters": {
+            "enable_depth": depth_enabled,
+            "confidence_threshold": safe(lambda: rt.confidence_threshold),
+            "texture_confidence_threshold": safe(lambda: rt.texture_confidence_threshold),
+            "enable_fill_mode": safe(lambda: rt.enable_fill_mode),
+            "remove_saturated_areas": safe(lambda: rt.remove_saturated_areas),
+        },
+    }
+    return True, "ok", rt, open_params, tracking_ok, warnings
+
+
+def start_session(zed, engine, session, open_params: dict, speed_plan=None,
+                  disk_bench_mb_s=None):
+    """Write calibration + metadata, start encoders, then start capture. Returns (ok, msg)."""
+    opts = session.opts
+    field_info = session.field_info
+    # Calibration + metadata BEFORE the first frame, so a crash still leaves them.
+    cam_info = camera_info_dict(zed)
+    write_json_atomic(os.path.join(session.dir, "calibration.json"), cam_info)
+    write_legacy_calibration_txt(cam_info, os.path.join(session.dir, "calibration_params.txt"))
+    conf_src = copy_factory_calibration(cam_info.get("serial_number"), session.dir)
+    session.metadata = {
+        "app": {"name": APP_NAME, "version": APP_VERSION, "script": os.path.abspath(__file__)},
+        "start_time": now_iso(),
+        "field": field_info,
+        "camera": {k: cam_info[k] for k in ("serial_number", "camera_model", "camera_firmware_version",
+                                            "sensors_firmware_version", "resolution", "fps")},
+        "camera_settings_at_start": dict(engine.cam_settings),
+        "capture": {**open_params, "svo_compression": opts["svo_compression"] if opts["record_svo"] else None,
+                    "record_svo": opts["record_svo"], "record_mkv": opts["record_mkv"]},
+        "encoding": {
+            "rgb": "FFV1 level 3, intra-only (-g 1), 24 slices with CRC, bgr0 (lossless 8-bit BGR)",
+            "depth": "FFV1 gray16le", "depth_units_per_mm": opts["depth_units_per_mm"],
+            "depth_codes": {"no_data_nan": DEPTH_CODE_NAN, "too_close": DEPTH_CODE_TOO_CLOSE,
+                            "too_far_or_out_of_range": DEPTH_CODE_TOO_FAR,
+                            "max_valid": DEPTH_CODE_MAX_VALID},
+            "confidence": "FFV1 gray16le", "confidence_scale": opts["confidence_scale"],
+            "confidence_nan_code": CONF_CODE_NAN,
+            "mkv_framerate_note": "Constant nominal rate; true timing is image_timestamp_ns in frames.csv",
+        },
+        "frames_csv_columns": FRAME_CSV_COLUMNS,
+        "speed_plan": speed_plan,
+        "factory_calibration_file": conf_src,
+        "host": {"hostname": socket.gethostname(), "platform": platform.platform(),
+                 "jetson": jetson_info() if IS_JETSON else None,
+                 "python": sys.version.split()[0], "numpy": np.__version__,
+                 "opencv": cv2.__version__, "ffmpeg": ffmpeg_version(),
+                 "zed_sdk": safe(lambda: str(sl.Camera.get_sdk_version())),
+                 "disk_benchmark_mb_s": disk_bench_mb_s},
+        "status": "RECORDING (if this persists the app did not stop cleanly; data up to the "
+                  "crash is still usable - run verify_session.py)",
+    }
+    write_json_atomic(session.metadata_path, session.metadata)
+    with open(os.path.join(session.dir, "README.txt"), "w", encoding="utf-8") as f:
+        f.write(session_readme(session.metadata))
+
+    try:
+        session.setup_writers(engine.width, engine.height, engine.fps,
+                              with_depth=open_params["depth_enabled"])
+    except Exception as e:
+        session.log_event("ERROR", f"cannot start ffmpeg: {e}")
+        for w in session.writers:
+            if w.is_alive():
+                w.finish()
+            elif w.proc is not None:
+                safe(w.proc.kill)
+        session.close_log()
+        return False, f"cannot start encoders: {e}"
+
+    ok, msg = engine.submit("start_session", session)
+    if not ok:
+        session.log_event("ERROR", f"start failed: {msg}")
+        session.finalize()  # closes the (empty) encoders and files
+        session.close_log()
+        return False, msg
+    session.start_iso = now_iso()
+    session.log_event("INFO", f"recording started -> {session.dir}")
+    return True, "ok"
+
+
+def finish_session_metadata(session) -> dict:
+    """After session.finalize(): write final statistics/verification and close the log."""
+    stats = session.stats()
+    session.metadata.update({"end_time": session.end_iso, "statistics": stats,
+                             "verification": session.verification,
+                             "status": "COMPLETE" if session.verification.get("all_ok") else
+                             "COMPLETE_WITH_WARNINGS"})
+    try:
+        write_json_atomic(session.metadata_path, session.metadata)
+    except Exception as e:
+        print(f"[ERROR] cannot write metadata: {e}")
+    session.log_event("INFO", f"finalized: {json.dumps(to_jsonable(stats))}")
+    session.close_log()
+    return stats
+
+
+def jetson_info() -> dict:
+    info = {}
+    try:
+        with open("/etc/nv_tegra_release", encoding="utf-8") as f:
+            info["l4t"] = f.readline().strip()
+    except Exception:
+        pass
+    try:
+        with open("/proc/device-tree/model", encoding="utf-8") as f:
+            info["model"] = f.read().strip("\x00\n ")
+    except Exception:
+        pass
+    if shutil.which("nvpmodel"):
+        r = safe(lambda: subprocess.run(["nvpmodel", "-q"], capture_output=True, text=True,
+                                        timeout=5).stdout)
+        if r:
+            info["nvpmodel"] = " ".join(r.split())
+    return info
+
 ###############################################################################
 # GUI
 ###############################################################################
@@ -1266,7 +1546,7 @@ class ZEDTkApp:
         style.map("Rec.TButton", background=[("active", "#8E0000"), ("disabled", "#9AA5B1")])
         style.configure("WeedScan.TLabel", font=("Times New Roman", 18, "bold"),
                         foreground="#BA0C2F", background="#E9ECEF")
-        style.configure("Big.TLabel", font=("Consolas", 10), background="white")
+        style.configure("Big.TLabel", font=("Consolas" if IS_WINDOWS else "DejaVu Sans Mono", 10), background="white")
         style.configure("Speed.TLabel", font=("Segoe UI", 16, "bold"), background="white")
         self.root.configure(bg="white")
 
@@ -1302,7 +1582,10 @@ class ZEDTkApp:
         self.fps_menu.grid(row=0, column=3, sticky="w")
         self._update_fps_choices()
         ttk.Label(cam, text="Live depth").grid(row=1, column=0, sticky="w")
-        self.depth_var = tk.StringVar(value=CONFIG["default_depth_mode"])
+        default_depth = CONFIG["default_depth_mode"]
+        if not (default_depth.startswith("NONE") or hasattr(sl.DEPTH_MODE, default_depth)):
+            default_depth = "NEURAL"  # e.g. NEURAL_LIGHT needs ZED SDK >= 4.2
+        self.depth_var = tk.StringVar(value=default_depth)
         avail = [m for m in DEPTH_MODES if m.startswith("NONE") or hasattr(sl.DEPTH_MODE, m)]
         self.depth_menu = ttk.Combobox(cam, textvariable=self.depth_var, values=avail, width=18,
                                        state="readonly")
@@ -1394,7 +1677,7 @@ class ZEDTkApp:
         self.svo_mode_var = tk.StringVar(value=list(SVO_COMPRESSION)[0])
         ttk.Combobox(rec, textvariable=self.svo_mode_var, values=list(SVO_COMPRESSION), width=32,
                      state="readonly").grid(row=0, column=1, columnspan=2, sticky="w")
-        self.mkv_var = tk.BooleanVar(value=True)
+        self.mkv_var = tk.BooleanVar(value=bool(CONFIG["default_record_mkv"]))
         ttk.Checkbutton(rec, text="Live FFV1 RGB + Depth + Confidence (.mkv)",
                         variable=self.mkv_var).grid(row=1, column=0, columnspan=3, sticky="w")
         self.start_btn = ttk.Button(rec, text="● Start Recording", style="Rec.TButton",
@@ -1450,72 +1733,20 @@ class ZEDTkApp:
         depth_enabled = not depth_choice.startswith("NONE")
         tracking = self.track_var.get() and depth_enabled
 
-        ip = sl.InitParameters()
-        ip.camera_resolution = getattr(sl.RESOLUTION, res_name)
-        ip.camera_fps = fps
-        ip.depth_mode = getattr(sl.DEPTH_MODE, depth_choice) if depth_enabled else sl.DEPTH_MODE.NONE
-        ip.coordinate_units = sl.UNIT.MILLIMETER
-        ip.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
-        # AUTO flip uses the IMU at open(); a downward-looking camera can come out
-        # randomly flipped between sessions. Force a fixed orientation.
-        safe(lambda: setattr(ip, "camera_image_flip", sl.FLIP_MODE.OFF))
-        safe(lambda: setattr(ip, "depth_stabilization", int(CONFIG["depth_stabilization"])))
-        ip.depth_minimum_distance = -1  # SDK default minimum (~300 mm for ZED 2i)
-
-        self._set_status(f"Opening ZED {res_name}@{fps} depth={depth_choice} …")
+        self._set_status(f"Opening ZED {res_name}@{fps} depth={depth_choice} … (the FIRST use of a "
+                         f"NEURAL model on a new device optimizes it and can take 5-20 min; run "
+                         f"zed_doctor.py --optimize beforehand)")
         self.root.update_idletasks()
-        err = self.zed.open(ip)
-        if err != sl.ERROR_CODE.SUCCESS:
-            messagebox.showerror("ZED open error", f"Cannot open ZED camera:\n{err}")
+        ok, msg, rt, self.open_params, tracking_ok, warnings = open_zed(
+            self.zed, res_name, fps, depth_choice, tracking)
+        if not ok:
+            messagebox.showerror("ZED open error", f"Cannot open ZED camera:\n{msg}")
             self._set_status("Camera open failed")
             return
-
-        info = self.zed.get_camera_information()
-        cfg = info.camera_configuration
-        if cfg.fps != fps or cfg.resolution.width <= 0:
-            messagebox.showwarning("Camera mode", f"Camera opened at {cfg.resolution.width}x"
-                                                  f"{cfg.resolution.height}@{cfg.fps} (requested {fps}).")
-
-        tracking_ok = False
-        if tracking:
-            tp = sl.PositionalTrackingParameters()
-            safe(lambda: setattr(tp, "enable_imu_fusion", True))
-            safe(lambda: setattr(tp, "set_gravity_as_origin", True))
-            terr = self.zed.enable_positional_tracking(tp)
-            tracking_ok = terr == sl.ERROR_CODE.SUCCESS
-            if not tracking_ok:
-                messagebox.showwarning("Tracking", f"Positional tracking unavailable ({terr}); "
-                                                   "speed will not be shown.")
-
-        rt = sl.RuntimeParameters()
-        rt.enable_depth = depth_enabled
-        safe(lambda: setattr(rt, "confidence_threshold", CONFIG["confidence_threshold"]))
-        safe(lambda: setattr(rt, "texture_confidence_threshold", CONFIG["texture_confidence_threshold"]))
-        safe(lambda: setattr(rt, "enable_fill_mode", CONFIG["enable_fill_mode"]))
-        safe(lambda: setattr(rt, "measure3D_reference_frame", sl.REFERENCE_FRAME.CAMERA))
-
+        for w in warnings:
+            messagebox.showwarning("Camera", w)
         self.cam_info = camera_info_dict(self.zed)
-        self.open_params = {
-            "resolution": res_name, "fps": cfg.fps,
-            "width": cfg.resolution.width, "height": cfg.resolution.height,
-            "depth_mode": depth_choice if depth_enabled else "NONE",
-            "depth_enabled": depth_enabled, "positional_tracking": tracking_ok,
-            "init_parameters": {
-                "coordinate_units": "MILLIMETER", "coordinate_system": "IMAGE",
-                "camera_image_flip": safe(lambda: enum_name(ip.camera_image_flip)),
-                "depth_stabilization": safe(lambda: ip.depth_stabilization),
-                "depth_minimum_distance": safe(lambda: ip.depth_minimum_distance),
-                "depth_maximum_distance": safe(lambda: ip.depth_maximum_distance),
-                "enable_image_enhancement": safe(lambda: ip.enable_image_enhancement),
-            },
-            "runtime_parameters": {
-                "enable_depth": depth_enabled,
-                "confidence_threshold": safe(lambda: rt.confidence_threshold),
-                "texture_confidence_threshold": safe(lambda: rt.texture_confidence_threshold),
-                "enable_fill_mode": safe(lambda: rt.enable_fill_mode),
-                "remove_saturated_areas": safe(lambda: rt.remove_saturated_areas),
-            },
-        }
+        cfg = self.zed.get_camera_information().camera_configuration
 
         # Fit the side-by-side preview on screen (controls take ~620 px of height).
         self.root.update_idletasks()
@@ -1679,70 +1910,12 @@ class ZEDTkApp:
         except Exception as e:
             messagebox.showerror("Session", f"Cannot create session folder:\n{e}")
             return
-
-        # Calibration + metadata BEFORE the first frame, so a crash still leaves them.
-        cam_info = camera_info_dict(self.zed)
-        write_json_atomic(os.path.join(session.dir, "calibration.json"), cam_info)
-        write_legacy_calibration_txt(cam_info, os.path.join(session.dir, "calibration_params.txt"))
-        conf_src = copy_factory_calibration(cam_info.get("serial_number"), session.dir)
-        session.metadata = {
-            "app": {"name": APP_NAME, "version": APP_VERSION, "script": os.path.abspath(__file__)},
-            "start_time": now_iso(),
-            "field": field_info,
-            "camera": {k: cam_info[k] for k in ("serial_number", "camera_model", "camera_firmware_version",
-                                                "sensors_firmware_version", "resolution", "fps")},
-            "camera_settings_at_start": dict(self.engine.cam_settings),
-            "capture": {**self.open_params, "svo_compression": opts["svo_compression"] if opts["record_svo"] else None,
-                        "record_svo": opts["record_svo"], "record_mkv": opts["record_mkv"]},
-            "encoding": {
-                "rgb": "FFV1 level 3, intra-only (-g 1), 24 slices with CRC, bgr0 (lossless 8-bit BGR)",
-                "depth": "FFV1 gray16le", "depth_units_per_mm": opts["depth_units_per_mm"],
-                "depth_codes": {"no_data_nan": DEPTH_CODE_NAN, "too_close": DEPTH_CODE_TOO_CLOSE,
-                                "too_far_or_out_of_range": DEPTH_CODE_TOO_FAR,
-                                "max_valid": DEPTH_CODE_MAX_VALID},
-                "confidence": "FFV1 gray16le", "confidence_scale": opts["confidence_scale"],
-                "confidence_nan_code": CONF_CODE_NAN,
-                "mkv_framerate_note": "Constant nominal rate; true timing is image_timestamp_ns in frames.csv",
-            },
-            "frames_csv_columns": FRAME_CSV_COLUMNS,
-            "speed_plan": self._plan(),
-            "factory_calibration_file": conf_src,
-            "host": {"hostname": socket.gethostname(), "platform": platform.platform(),
-                     "python": sys.version.split()[0], "numpy": np.__version__,
-                     "opencv": cv2.__version__, "ffmpeg": ffmpeg_version(),
-                     "zed_sdk": safe(lambda: str(sl.Camera.get_sdk_version())),
-                     "disk_benchmark_mb_s": self.disk_bench_mb_s},
-            "status": "RECORDING (if this persists the app did not stop cleanly; data up to the "
-                      "crash is still usable - run verify_session.py)",
-        }
-        write_json_atomic(session.metadata_path, session.metadata)
-        with open(os.path.join(session.dir, "README.txt"), "w", encoding="utf-8") as f:
-            f.write(session_readme(session.metadata))
-
-        try:
-            session.setup_writers(self.engine.width, self.engine.height, self.engine.fps,
-                                  with_depth=self.open_params["depth_enabled"])
-        except Exception as e:
-            session.log_event("ERROR", f"cannot start ffmpeg: {e}")
-            for w in session.writers:
-                if w.is_alive():
-                    w.finish()
-                elif w.proc is not None:
-                    safe(w.proc.kill)
-            messagebox.showerror("FFmpeg", f"Cannot start encoders:\n{e}")
-            session.close_log()
-            return
-
-        ok, msg = self.engine.submit("start_session", session)
+        ok, msg = start_session(self.zed, self.engine, session, self.open_params,
+                                speed_plan=self._plan(), disk_bench_mb_s=self.disk_bench_mb_s)
         if not ok:
-            session.log_event("ERROR", f"start failed: {msg}")
-            session.finalize()  # closes the (empty) encoders and files
-            session.close_log()
             messagebox.showerror("Recording", f"Could not start recording:\n{msg}")
             return
 
-        session.start_iso = now_iso()
-        session.log_event("INFO", f"recording started -> {session.dir}")
         self.session = session
         self.last_size = (time.monotonic(), 0)
         self.write_rate_mb_s = None
@@ -1788,17 +1961,7 @@ class ZEDTkApp:
         self._drain_ui_events()
 
     def _on_finalized(self, session: RecordingSession):
-        stats = session.stats()
-        session.metadata.update({"end_time": session.end_iso, "statistics": stats,
-                                 "verification": session.verification,
-                                 "status": "COMPLETE" if session.verification.get("all_ok") else
-                                 "COMPLETE_WITH_WARNINGS"})
-        try:
-            write_json_atomic(session.metadata_path, session.metadata)
-        except Exception as e:
-            print(f"[ERROR] cannot write metadata: {e}")
-        session.log_event("INFO", f"finalized: {json.dumps(to_jsonable(stats))}")
-        session.close_log()
+        stats = finish_session_metadata(session)
         self.finalizing = False
         keep_system_awake(False)
         play_wav_async(CONFIG["wave_stop_path"])

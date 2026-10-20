@@ -50,6 +50,10 @@ Session_20261008_101500_plotA/
 
 If the operator disabled the live .mkv output, only the SVO2 file and the metadata
 files exist. Use `extract_svo.py` (section 8) in that case.
+**Sessions recorded on the Jetson have no live .mkv by default.** Its CPU cannot
+encode them at HD2K. `session_metadata.json → capture.record_mkv` tells you which case
+you have, and `host.jetson` identifies the recording device. Run
+`extract_svo.py --mkv` (or the PNG export) on a PC to produce the same files.
 
 ## 3. Image data: `RGB_left.mkv`
 
