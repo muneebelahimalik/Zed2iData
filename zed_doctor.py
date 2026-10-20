@@ -313,6 +313,11 @@ def bench(sl, out, configs, seconds, keep=False):
                f"CPU {cpu or 0:.0f}% | SVO compress "
                + (f"{comp:.0f}/{st.get('svo_compression_ms_max') or 0:.0f} ms mean/max" if comp else "n/a")
                + (f" | mkv dropped {st['mkv_frames_dropped_backlog']}" if mkv else ""))
+        loop = st.get("capture_loop") or {}
+        if loop.get("step_max_ms"):
+            worst = sorted(loop["step_max_ms"].items(), key=lambda kv: -kv[1])
+            print("      capture loop worst-case ms: " + ", ".join(f"{k} {v:.0f}" for k, v in worst)
+                  + (f" | slow steps: {loop['slow_step_counts']}" if loop.get("slow_step_counts") else ""))
         results.append((label, lossless and not st["mkv_frames_dropped_backlog"]))
     if keep:
         print(f"\n  benchmark sessions kept in {bench_dir}")

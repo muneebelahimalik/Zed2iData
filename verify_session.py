@@ -82,15 +82,23 @@ def svo_timestamps(path):
         return None
     rt = sl.RuntimeParameters()
     rt.enable_depth = False
+    n_total = cam.get_svo_number_of_frames()
+    end_code = getattr(sl.ERROR_CODE, "END_OF_SVOFILE_REACHED", None)
     out = []
+    failures = 0
     while True:
         err = cam.grab(rt)
         if err == sl.ERROR_CODE.SUCCESS:
+            failures = 0
             out.append(cam.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
-        elif "END_OF_SVOFILE" in str(err):
+            if n_total > 0 and len(out) >= n_total:
+                break
+        elif err == end_code or "".join(c for c in str(err).upper() if c.isalnum()) == "ENDOFSVOFILEREACHED":
             break
         else:
-            continue
+            failures += 1
+            if failures > 100 or (n_total > 0 and cam.get_svo_position() >= n_total - 1):
+                break  # never loop forever on an unexpected error code
     cam.close()
     return out
 

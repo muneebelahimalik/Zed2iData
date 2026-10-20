@@ -182,6 +182,19 @@ def safe(fn, default=None):
         return default
 
 
+def err_is(err, name: str) -> bool:
+    """True if a ZED ERROR_CODE equals ERROR_CODE.<name>.
+
+    Never compare str(err): its text changed between SDK versions
+    (SDK 4: 'END_OF_SVOFILE_REACHED', SDK 5: 'END OF SVO FILE REACHED').
+    """
+    code = getattr(sl.ERROR_CODE, name, None)
+    if code is not None and err == code:
+        return True
+    norm = lambda x: "".join(ch for ch in str(x).upper() if ch.isalnum())
+    return norm(err).endswith(norm(name))
+
+
 def enum_name(value) -> str:
     s = str(value)
     return s.split(".")[-1] if "." in s else s
@@ -1044,6 +1057,7 @@ class RecordingSession:
             "estimated_missing_camera_frames": self.est_missing,
             "camera_reported_dropped_frames": cam_drop,
             "duplicate_frames_skipped": self.duplicates,
+            "capture_loop": getattr(self, "loop_diagnostics", None),
             "svo_compression_ms_mean": (self.svo_comp_sum_ms / self.svo_comp_n) if self.svo_comp_n else None,
             "svo_compression_ms_max": self.svo_comp_max_ms or None,
             "grab_errors": dict(self.grab_errors),
@@ -1153,6 +1167,8 @@ class CaptureEngine(threading.Thread):
         self.last_preview = 0.0
         self.last_image_ts = None
         self.duplicate_frames = 0
+        self.step_max = {}
+        self.slow_steps = collections.Counter()
         self.prev_image_mat = sl.Mat()
         self.prev_depth_mat = sl.Mat()
         scale = min(1.0, (CONFIG["preview_max_width"] / 2) / max(1, width))
@@ -1195,11 +1211,18 @@ class CaptureEngine(threading.Thread):
         self.prev_pos = None
         self.session = session
         session.started_mono = time.monotonic()
+        self.step_max = {}
+        self.slow_steps = collections.Counter()
         return True, "ok"
 
     def _cmd_stop_session(self):
         s = self.session
         self.session = None
+        if s is not None:
+            s.loop_diagnostics = {
+                "slow_step_counts": dict(self.slow_steps),
+                "step_max_ms": {k: round(v * 1000, 1) for k, v in self.step_max.items()},
+            }
         if s is not None and s.svo_path:
             try:
                 self.zed.disable_recording()
@@ -1321,7 +1344,9 @@ class CaptureEngine(threading.Thread):
             if self.consecutive_errors:
                 self._ui("info", f"camera recovered after {self.consecutive_errors} failed grabs")
             self.consecutive_errors = 0
-            self.grab_times.append(time.perf_counter() - t_grab)
+            t_after_grab = time.perf_counter()
+            self.grab_times.append(t_after_grab - t_grab)
+            steps = {"grab": t_after_grab - t_grab}
 
             ts = safe(lambda: self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
             if ts is not None and self.last_image_ts is not None and ts <= self.last_image_ts:
@@ -1334,7 +1359,9 @@ class CaptureEngine(threading.Thread):
             self.last_image_ts = ts
             sys_ns = time.time_ns()
             if self.grab_idx % CONFIG["camera_settings_poll_frames"] == 0:
+                t0 = time.perf_counter()
                 self._poll_camera_settings()
+                steps["camera_settings"] = time.perf_counter() - t0
 
             recording = self.session is not None
             want_preview = (time.monotonic() - self.last_preview) >= CONFIG["preview_interval_s"]
@@ -1348,6 +1375,7 @@ class CaptureEngine(threading.Thread):
             img_mat, dep_mat, res_args = ((self.image_mat, self.depth_mat, ()) if full_res else
                                           (self.prev_image_mat, self.prev_depth_mat,
                                            (sl.MEM.CPU, self.preview_res)))
+            t0 = time.perf_counter()
             if need_image:
                 self.zed.retrieve_image(img_mat, sl.VIEW.LEFT, *res_args)
                 bgra = img_mat.get_data()
@@ -1358,6 +1386,8 @@ class CaptureEngine(threading.Thread):
                     self.zed.retrieve_measure(self.conf_mat, sl.MEASURE.CONFIDENCE)
                     conf = self.conf_mat.get_data()
 
+            steps["retrieve"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             fi = {"grab_idx": self.grab_idx, "image_timestamp_ns": ts, "system_time_ns": sys_ns,
                   "system_time_iso": datetime.datetime.fromtimestamp(sys_ns / 1e9).isoformat(
                       timespec="milliseconds"),
@@ -1365,8 +1395,12 @@ class CaptureEngine(threading.Thread):
             fi.update(self.cam_settings)
             if self.tracking_enabled:
                 safe(lambda: self._read_pose(fi, ts))
+            steps["pose"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             safe(lambda: self._read_sensors(fi))
+            steps["sensors"] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             if recording:
                 s = self.session
                 if s.svo_path:
@@ -1383,19 +1417,41 @@ class CaptureEngine(threading.Thread):
                 else:
                     bgra_c = depth_c = conf_c = None
                 s.on_frame(fi, bgra_c, depth_c, conf_c, self.period_ms)
+            steps["record"] = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             if want_preview and bgra is not None:
                 self.last_preview = time.monotonic()
                 self._update_preview(bgra, depth, fi)
             else:
                 with self.latest_lock:
                     self.latest["fi"] = fi
+            steps["preview"] = time.perf_counter() - t0
+            self._note_step_times(steps)
             self.grab_idx += 1
 
         # leaving: make sure SVO is closed properly
         if self.session is not None:
             self._cmd_stop_session()
         self._process_commands()
+
+    def _note_step_times(self, steps: dict) -> None:
+        """Keep per-step worst cases; log any step that could make the camera drop frames.
+
+        grab() normally waits for the next frame, so it is only 'slow' beyond 1.5 periods;
+        every other step should take a few ms.
+        """
+        period_s = self.period_ms / 1000.0
+        for name, dt in steps.items():
+            if dt > self.step_max.get(name, 0.0):
+                self.step_max[name] = dt
+            limit = 1.5 * period_s if name == "grab" else 0.5 * period_s
+            if dt > limit:
+                self.slow_steps[name] += 1
+                if self.session is not None and self.slow_steps[name] <= 20:
+                    self.session.log_event(
+                        "WARN", f"slow step '{name}' took {dt * 1000:.0f} ms at grab {self.grab_idx} "
+                                f"(steps: " + ", ".join(f"{k} {v * 1000:.0f}" for k, v in steps.items()) + " ms)")
 
     def _update_preview(self, bgra, depth, fi):
         h, w = bgra.shape[:2]
@@ -1453,7 +1509,7 @@ def open_zed(zed, res_name: str, fps: int, depth_choice: str, tracking: bool):
     err = zed.open(ip)
     if err != sl.ERROR_CODE.SUCCESS:
         hint = ""
-        if "NOT_DETECTED" in str(err) or "DETECTION" in str(err):
+        if err_is(err, "CAMERA_NOT_DETECTED") or err_is(err, "CAMERA_DETECTION_ISSUE"):
             hint = ("\nCheck the USB 3 cable/port (run zed_doctor.py) and that no other "
                     "program (ZED Explorer, Depth Viewer) is using the camera.")
         return False, f"{err}{hint}", None, None, False, []

@@ -42,7 +42,7 @@ import pyzed.sl as sl
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from Zed2i_video_datacollection import (  # noqa: E402
-    CONFIG, camera_info_dict, encode_confidence_u16, encode_depth_u16, to_jsonable, enum_name,
+    CONFIG, camera_info_dict, err_is, encode_confidence_u16, encode_depth_u16, to_jsonable, enum_name,
     safe, popen_hidden_kwargs)
 
 
@@ -181,7 +181,7 @@ def main():
             break
         if err != sl.ERROR_CODE.SUCCESS:
             print(f"[WARN] grab: {err}")
-            if "END" in str(err):
+            if err_is(err, "END_OF_SVOFILE_REACHED"):
                 break
             continue
         fno = zed.get_svo_position()
