@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 RESULTS = []
+IS_WINDOWS = os.name == "nt"
 
 
 def report(level, what, detail="", fix=""):
@@ -53,15 +54,20 @@ def check_platform():
         report("OK", "NVIDIA Jetson", f"{model} | {l4t.splitlines()[0]}")
         if shutil.which("nvpmodel"):
             r = subprocess.run(["nvpmodel", "-q"], capture_output=True, text=True)
-            mode = " ".join(r.stdout.split())
+            mode = " ".join(l for l in r.stdout.split("\n") if "NVPM ERROR" not in l).strip()
+            mode = " ".join(mode.split())
             report("INFO", "power mode", mode or r.stderr.strip())
             if "MAXN" not in mode.upper():
                 report("WARN", "power mode is not MAXN",
                        fix="sudo nvpmodel -m 0 && sudo jetson_clocks   (or ./jetson/setup_jetson.sh --max-perf); "
                            "check 'nvpmodel -q --verbose' for your module's max mode")
-        cpu_gov = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
-        if cpu_gov and cpu_gov != "performance":
-            report("WARN", f"CPU governor '{cpu_gov}' (clocks not locked)",
+        # jetson_clocks pins min == max frequency (the governor name may stay 'schedutil')
+        fmin = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq")
+        fmax = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+        if fmin and fmax and fmin == fmax:
+            report("OK", "CPU clocks locked", f"{int(fmax) / 1e6:.2f} GHz")
+        elif fmin and fmax:
+            report("WARN", f"CPU clocks not locked ({int(fmin) / 1e6:.2f}-{int(fmax) / 1e6:.2f} GHz)",
                    fix="sudo jetson_clocks   (run after every boot, or use setup_jetson.sh --max-perf)")
     else:
         report("INFO", "not a Jetson", f"{sys.platform} {model or ''}")
@@ -176,7 +182,26 @@ def check_camera(sl):
 def check_disk(out):
     print("\n== Storage ==")
     import Zed2i_video_datacollection as app
+    problem = app.storage_problem(out)
+    if problem:
+        report("FAIL", "data drive not mounted", problem,
+               "mount the SSD (and add it to /etc/fstab, see JETSON.md)")
+        return None
     os.makedirs(out, exist_ok=True)
+    mp = app.mount_point_of(out)
+    if mp != "/" and not IS_WINDOWS:
+        in_fstab = False
+        try:
+            with open("/etc/fstab", encoding="utf-8") as f:
+                in_fstab = any(len(l.split()) > 1 and l.split()[1] == mp
+                               for l in f if not l.lstrip().startswith("#"))
+        except Exception:
+            pass
+        if in_fstab:
+            report("OK", "data drive mounted at boot", f"{mp} is in /etc/fstab")
+        else:
+            report("WARN", f"{mp} is not in /etc/fstab (won't be mounted after a reboot)",
+                   fix="sudo ./jetson/setup_jetson.sh --data-dir <dir> --fstab   (see JETSON.md)")
     free = app.get_free_space_bytes(out)
     try:
         dev = subprocess.run(["df", "-hT", out], capture_output=True, text=True).stdout.splitlines()[-1]
@@ -222,6 +247,10 @@ def bench(sl, out, configs, seconds):
     import queue as _q
     import Zed2i_video_datacollection as app
     print("\n== Recording benchmark (real camera, real disk) ==")
+    problem = app.storage_problem(out)
+    if problem:
+        report("FAIL", "benchmark skipped", problem)
+        return
     bench_dir = tempfile.mkdtemp(prefix="zed_bench_", dir=out)
     results = []
     for res, fps, depth, svo_mode, mkv in configs:

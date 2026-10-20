@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 # One-time setup of a Jetson (JetPack + ZED SDK already installed) for WeedScan recording.
 #
-#   sudo ./jetson/setup_jetson.sh [--max-perf] [--data-dir /media/<user>/<SSD>/ZED_Data]
+#   sudo ./jetson/setup_jetson.sh [--max-perf] [--data-dir /media/<user>/<SSD>/ZED_Data [--fstab]]
 #
 #   - installs the system packages the recorder needs (does NOT touch numpy / pyzed)
 #   - installs a udev rule so the ZED 2i is never USB-autosuspended (avoids mid-run dropouts)
 #   - optionally sets the max power mode + locks clocks now and at every boot (--max-perf)
 #   - writes config_local.json with your data folder (--data-dir)
+#   - with --fstab: mounts that SSD automatically at every boot (UUID entry, 'nofail')
 #   - adds a "WeedScan" desktop launcher
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAX_PERF=0
 DATA_DIR=""
+FSTAB=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --max-perf) MAX_PERF=1; shift ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
+    --fstab) FSTAB=1; shift ;;
     *) echo "unknown option $1"; exit 1 ;;
   esac
 done
@@ -73,6 +76,30 @@ fi
 
 if [[ -n "$DATA_DIR" ]]; then
   echo "== Data folder: $DATA_DIR =="
+  # find the existing ancestor and the filesystem it lives on
+  probe="$DATA_DIR"; while [[ ! -e "$probe" ]]; do probe="$(dirname "$probe")"; done
+  MNT="$(findmnt -n -o TARGET -T "$probe" | head -n1)"
+  if [[ "$MNT" == "/" && "$DATA_DIR" == /media/* || "$MNT" == "/" && "$DATA_DIR" == /mnt/* ]]; then
+    echo "ERROR: $DATA_DIR is on an external drive that is not mounted (would land on the system disk)."
+    echo "       Mount the SSD first, then re-run with --data-dir ... --fstab"
+    exit 1
+  fi
+  if [[ "$MNT" != "/" ]]; then
+    SRC="$(findmnt -n -o SOURCE -T "$probe" | head -n1)"
+    FST="$(findmnt -n -o FSTYPE -T "$probe" | head -n1)"
+    UUID="$(blkid -s UUID -o value "$SRC" || true)"
+    if grep -Eq "^[^#]*[[:space:]]$MNT[[:space:]]" /etc/fstab; then
+      echo "$MNT already in /etc/fstab"
+    elif [[ $FSTAB -eq 1 && -n "$UUID" ]]; then
+      cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+      echo "UUID=$UUID  $MNT  $FST  defaults,nofail,noatime,x-systemd.device-timeout=10  0  2" >> /etc/fstab
+      systemctl daemon-reload || true
+      echo "added $MNT (UUID=$UUID) to /etc/fstab (backup saved next to it); it will mount at every boot"
+    else
+      echo "NOTE: $MNT is not in /etc/fstab, so it will NOT be mounted after a reboot."
+      echo "      Re-run with --fstab, or add:  UUID=$UUID  $MNT  $FST  defaults,nofail,noatime  0  2"
+    fi
+  fi
   mkdir -p "$DATA_DIR"
   chown "$RUN_USER":"$RUN_USER" "$DATA_DIR"
   if [[ ! -f "$REPO/config_local.json" ]]; then

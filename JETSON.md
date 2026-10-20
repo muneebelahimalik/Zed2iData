@@ -14,8 +14,23 @@ cd ~/Zed2iData
 python3 -c "import pyzed.sl as sl; print(sl.Camera.get_sdk_version())" \
   || python3 /usr/local/zed/get_python_api.py
 
-# system packages, ZED USB power rule, max performance, data folder, desktop launcher
-sudo ./jetson/setup_jetson.sh --max-perf --data-dir /media/$USER/<YOUR_SSD>/ZED_Data
+# mount the data SSD first (see "Data SSD" below), then:
+# system packages, ZED USB power rule, max performance, data folder + auto-mount, launcher
+sudo ./jetson/setup_jetson.sh --max-perf --data-dir /media/$USER/<YOUR_SSD>/ZED_Data --fstab
+```
+
+### Data SSD
+
+The recorder **refuses to record to `/media/...` or `/mnt/...` when no drive is
+mounted there**. Otherwise the folder would silently be created on the small eMMC
+system disk. The SSD must therefore be mounted at every boot. `--fstab` adds a UUID
+entry with `nofail`, so the Jetson still boots if the SSD is removed. A backup of
+`/etc/fstab` is kept. To do the same by hand:
+
+```bash
+sudo blkid /dev/nvme0n1p1                       # note the UUID
+echo 'UUID=<uuid>  /media/pcp/Samsung_980_PRO  ext4  defaults,nofail,noatime,x-systemd.device-timeout=10  0  2' | sudo tee -a /etc/fstab
+sudo mount -a && findmnt /media/pcp/Samsung_980_PRO
 ```
 
 What `setup_jetson.sh` does:
@@ -52,6 +67,10 @@ calibration file (`/usr/local/zed/settings/SN<serial>.conf`), which needs intern
 * SDK detection;
 * the factory calibration file;
 * free space and sustained write speed of the data disk.
+
+The SDK log line "Self-calibration was skipped due to low texture" is harmless when the
+camera is pointing at a desk or wall. In the field, open the camera while it already
+looks at the soil and plants, so self-calibration has texture to work with.
 
 `--bench` records short test sessions at several settings. It then lists which
 settings ran with **zero lost frames on your Jetson**. Use one of those.

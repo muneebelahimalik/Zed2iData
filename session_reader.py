@@ -77,7 +77,9 @@ def read_mkv(path: str, width: int, height: int, kind: str, start: int = 0):
     nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
     cmd = ["ffmpeg", "-v", "error", "-i", path]
     if start:
-        cmd += ["-vf", f"select=gte(n\\,{start})", "-fps_mode", "passthrough"]
+        # drop the first `start` frames without re-timing (option name differs by ffmpeg version)
+        sync = ["-fps_mode", "passthrough"] if _ffmpeg_major() >= 5 else ["-vsync", "0"]
+        cmd += ["-vf", f"select=gte(n\\,{start})", *sync]
     cmd += ["-f", "rawvideo", "-pix_fmt", pix, "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     i = start
@@ -92,6 +94,20 @@ def read_mkv(path: str, width: int, height: int, kind: str, start: int = 0):
         proc.stdout.close()
         proc.kill()
         proc.wait()
+
+
+_FFMPEG_MAJOR = []
+
+
+def _ffmpeg_major() -> int:
+    if not _FFMPEG_MAJOR:
+        try:
+            out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout
+            ver = out.split()[2]  # "ffmpeg version 4.2.7-0ubuntu0.1 ..." / "n6.1" / "7.0.2"
+            _FFMPEG_MAJOR.append(int("".join(c for c in ver.split(".")[0] if c.isdigit()) or 0))
+        except Exception:
+            _FFMPEG_MAJOR.append(0)
+    return _FFMPEG_MAJOR[0]
 
 
 def quat_to_rot(qx, qy, qz, qw) -> np.ndarray:

@@ -74,6 +74,9 @@ def main():
         sys.exit("nothing to record (--no-svo without --mkv)")
     if a.mkv and not app.check_ffmpeg_available():
         sys.exit("ffmpeg not found (needed for --mkv)")
+    problem = app.storage_problem(a.out)
+    if problem:
+        sys.exit(problem)
     os.makedirs(a.out, exist_ok=True)
     free = app.get_free_space_bytes(a.out)
     if 0 <= free < CONFIG["min_free_space_gb"] * 1024 ** 3:

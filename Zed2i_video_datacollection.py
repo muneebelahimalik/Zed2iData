@@ -215,6 +215,40 @@ def write_json_atomic(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def mount_point_of(path: str) -> str:
+    """Mount point of the filesystem that holds path (or would hold it once created)."""
+    p = os.path.abspath(path)
+    while not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    while not os.path.ismount(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p
+
+
+def storage_problem(path: str):
+    """Return an error message if path points at an external drive that is NOT mounted.
+
+    Without this check a folder like /media/<user>/<SSD>/ZED_Data would silently be
+    created on the (small) system disk when the SSD is unplugged or not mounted.
+    """
+    if IS_WINDOWS:
+        drive = os.path.splitdrive(os.path.abspath(path))[0]
+        if drive and not os.path.exists(drive + "\\"):
+            return f"Drive {drive} is not available. Connect / map it first."
+        return None
+    ap = os.path.abspath(path)
+    if ap.startswith(("/media/", "/mnt/", "/run/media/")) and mount_point_of(ap) == "/":
+        return (f"{path} is on an external drive that is NOT mounted (it would be written to "
+                f"the system disk). Mount the SSD first (see JETSON.md: fstab entry).")
+    return None
+
+
 def get_free_space_bytes(path: str) -> int:
     try:
         probe = path
@@ -1869,6 +1903,10 @@ class ZEDTkApp:
         if not self.camera_opened or self.session is not None or self.finalizing:
             return
         base = self.base_dir_var.get().strip()
+        problem = storage_problem(base)
+        if problem:
+            messagebox.showerror("Save folder", problem)
+            return
         try:
             os.makedirs(base, exist_ok=True)
         except Exception as e:
@@ -2080,7 +2118,7 @@ class ZEDTkApp:
                     lo, hi = np.percentile(depth[finite], [2, 98])
                     hi = max(hi, lo + 1)
                     vis[finite] = (255 - np.clip((depth[finite] - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-                dcol = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+                dcol = cv2.applyColorMap(vis, getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET))
                 dcol[~finite] = 0
                 combined = np.hstack((bgr, dcol))
             else:
