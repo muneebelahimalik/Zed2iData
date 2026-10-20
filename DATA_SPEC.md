@@ -138,7 +138,7 @@ UTF-8 with a header row. An empty cell means "not available" for that frame.
 | `grab_idx` | frame counter since the camera was opened (spans recordings) |
 | `mkv_written` | `1` if this frame is in all three .mkv files, `0` if it was dropped from them because of encoder backlog (it is still in the SVO2) |
 | `mkv_frame_idx` | index of this frame inside the .mkv files (blank when `mkv_written=0`). **Use this to map a decoded .mkv frame to its row.** The values are contiguous: 0 … N−1 |
-| `svo_frame_ok` | `1` if the SVO2 stored this frame, `0` if the store failed, blank if SVO2 was disabled |
+| `svo_frame_ok` | SDK recording-status flag for this frame (`1` stored / `0` not stored, blank if SVO2 disabled). **Advisory only**: the SDK often reports `0` for the first frame. The authoritative check is `session_metadata.json → verification.svo.frames_in_file` vs `frames_logged`, or `verify_session.py --svo-full`, which matches every timestamp |
 | `image_timestamp_ns` | ZED hardware image timestamp (UTC epoch, ns). **This is the universal join key**: the same value appears in SVO2 extractions (`extract_svo.py → index.csv timestamp_ns`) |
 
 ### 6.2 Timing and integrity
@@ -148,6 +148,8 @@ UTF-8 with a header row. An empty cell means "not available" for that frame.
 | `system_time_ns`, `system_time_iso` | host PC clock when the frame was retrieved |
 | `dt_ms` | interval since the previous row's `image_timestamp_ns` |
 | `est_missing_before` | estimated number of camera frames missing before this row (timestamp gap > 1.5 × frame period). Non-zero means a gap in the sequence |
+
+Repeated frames are never written twice. If the SDK hands back an image it already delivered (same or older hardware timestamp), the recorder skips it: it gets no CSV row and no .mkv frame, and the count is in `statistics.duplicate_frames_skipped`. `image_timestamp_ns` is therefore strictly increasing in `frames.csv`.
 | `camera_dropped_total` | SDK cumulative dropped-frame counter |
 
 ### 6.3 Camera settings

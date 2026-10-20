@@ -274,6 +274,23 @@ def dir_size_bytes(path: str) -> int:
     return total
 
 
+def svo_frame_count(path: str):
+    """Number of frames stored in an SVO/SVO2 file, or None if it cannot be opened."""
+    try:
+        ip = sl.InitParameters()
+        ip.set_from_svo_file(path)
+        ip.depth_mode = sl.DEPTH_MODE.NONE
+        safe(lambda: setattr(ip, "svo_real_time_mode", False))
+        cam = sl.Camera()
+        if cam.open(ip) != sl.ERROR_CODE.SUCCESS:
+            return None
+        n = cam.get_svo_number_of_frames()
+        cam.close()
+        return int(n)
+    except Exception:
+        return None
+
+
 def check_ffmpeg_available() -> bool:
     try:
         r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
@@ -798,6 +815,10 @@ class RecordingSession:
         self.max_dt_ms = 0.0
         self.distance_m = 0.0
         self.svo_slow_warned = False
+        self.duplicates = 0
+        self.svo_comp_max_ms = 0.0
+        self.svo_comp_sum_ms = 0.0
+        self.svo_comp_n = 0
         self.finalized = False
         self.verification = {}
 
@@ -876,6 +897,11 @@ class RecordingSession:
             self.first_ts = ts
         self.last_ts = ts
 
+        cur = fi.get("_svo_compress_cur_ms")
+        if cur:
+            self.svo_comp_max_ms = max(self.svo_comp_max_ms, cur)
+            self.svo_comp_sum_ms += cur
+            self.svo_comp_n += 1
         comp_ms = fi.get("_svo_compress_ms")
         if comp_ms and comp_ms > period_ms and not self.svo_slow_warned:
             self.svo_slow_warned = True
@@ -886,8 +912,12 @@ class RecordingSession:
         if svo_ok == 1:
             self.svo_ok += 1
         elif svo_ok == 0:
+            # The SDK status flag is advisory (it is commonly 0 for the very first frame);
+            # finalize() counts the frames actually inside the SVO2 file.
             self.svo_failed += 1
-            self.log_event("ERROR", f"SVO failed to store rec frame {self.frames}")
+            if self.svo_failed <= 20 or self.svo_failed % 100 == 0:
+                self.log_event("WARN", f"SDK reported rec frame {self.frames} as not stored in SVO2 "
+                                       f"(x{self.svo_failed}; checked against the file at stop)")
 
         mkv_written = ""
         mkv_idx = ""
@@ -929,6 +959,12 @@ class RecordingSession:
             self.csv_file.flush()
             self.last_flush = now
         self.frames += 1
+
+    def note_duplicate(self, ts) -> None:
+        self.duplicates += 1
+        if self.duplicates <= 5 or self.duplicates % 100 == 0:
+            self.log_event("INFO", f"skipped a repeated camera frame (timestamp {ts}, "
+                                   f"x{self.duplicates}); not logged or encoded twice")
 
     def note_grab_error(self, err_name: str) -> None:
         self.grab_errors[err_name] += 1
@@ -975,11 +1011,20 @@ class RecordingSession:
             ver["streams_aligned"] = len(counts) == 1
             ok &= ver["streams_aligned"]
         if self.svo_path:
+            n_file = svo_frame_count(self.svo_path) if os.path.exists(self.svo_path) else -1
             ver["svo"] = {"file": os.path.basename(self.svo_path),
                           "exists": os.path.exists(self.svo_path),
                           "size_bytes": safe(lambda: os.path.getsize(self.svo_path)),
-                          "frames_reported_ok": self.svo_ok, "frames_failed": self.svo_failed}
-            ok &= ver["svo"]["exists"] and self.svo_failed == 0
+                          "frames_in_file": n_file, "frames_logged": self.frames,
+                          "sdk_status_ok": self.svo_ok, "sdk_status_not_ok": self.svo_failed}
+            if n_file is None:      # could not be checked (pyzed issue) -> rely on SDK status
+                ok &= ver["svo"]["exists"] and self.svo_failed == 0
+            else:
+                ver["svo"]["missing_frames"] = self.frames - n_file
+                ok &= n_file >= self.frames
+                if n_file < self.frames:
+                    self.log_event("ERROR", f"SVO2 holds {n_file} frames but {self.frames} were "
+                                            f"logged ({self.frames - n_file} missing)")
         ver["all_ok"] = bool(ok)
         self.verification = ver
         self.finalized = True
@@ -989,6 +1034,8 @@ class RecordingSession:
         cam_drop = None
         if self.camera_dropped_now is not None and self.camera_dropped_at_start is not None:
             cam_drop = self.camera_dropped_now - self.camera_dropped_at_start
+            if cam_drop < 0:  # SDK counter was reset
+                cam_drop = None
         return {
             "frames_grabbed": self.frames,
             "duration_s": duration,
@@ -996,6 +1043,9 @@ class RecordingSession:
             "max_frame_interval_ms": self.max_dt_ms,
             "estimated_missing_camera_frames": self.est_missing,
             "camera_reported_dropped_frames": cam_drop,
+            "duplicate_frames_skipped": self.duplicates,
+            "svo_compression_ms_mean": (self.svo_comp_sum_ms / self.svo_comp_n) if self.svo_comp_n else None,
+            "svo_compression_ms_max": self.svo_comp_max_ms or None,
             "grab_errors": dict(self.grab_errors),
             "svo_frames_ok": self.svo_ok,
             "svo_frames_failed": self.svo_failed,
@@ -1101,6 +1151,12 @@ class CaptureEngine(threading.Thread):
         self.latest_lock = threading.Lock()
         self.latest = {}
         self.last_preview = 0.0
+        self.last_image_ts = None
+        self.duplicate_frames = 0
+        self.prev_image_mat = sl.Mat()
+        self.prev_depth_mat = sl.Mat()
+        scale = min(1.0, (CONFIG["preview_max_width"] / 2) / max(1, width))
+        self.preview_res = sl.Resolution(max(1, int(width * scale)), max(1, int(height * scale)))
         self.grab_times = collections.deque(maxlen=60)
 
     # ---- command interface (GUI thread) -------------------------------------
@@ -1268,6 +1324,14 @@ class CaptureEngine(threading.Thread):
             self.grab_times.append(time.perf_counter() - t_grab)
 
             ts = safe(lambda: self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
+            if ts is not None and self.last_image_ts is not None and ts <= self.last_image_ts:
+                # The SDK handed back an image it already delivered (it is not stored in the
+                # SVO again either). Never log or encode it twice.
+                self.duplicate_frames += 1
+                if self.session:
+                    self.session.note_duplicate(ts)
+                continue
+            self.last_image_ts = ts
             sys_ns = time.time_ns()
             if self.grab_idx % CONFIG["camera_settings_poll_frames"] == 0:
                 self._poll_camera_settings()
@@ -1278,12 +1342,18 @@ class CaptureEngine(threading.Thread):
             need_image = want_preview or (recording and self.session.writers)
 
             bgra = depth = conf = None
+            full_res = recording and bool(self.session.writers)
+            # Preview-only frames are downscaled by the SDK on the GPU: no full-resolution
+            # copy to the CPU, which is the scarce resource on a Jetson.
+            img_mat, dep_mat, res_args = ((self.image_mat, self.depth_mat, ()) if full_res else
+                                          (self.prev_image_mat, self.prev_depth_mat,
+                                           (sl.MEM.CPU, self.preview_res)))
             if need_image:
-                self.zed.retrieve_image(self.image_mat, sl.VIEW.LEFT)
-                bgra = self.image_mat.get_data()
+                self.zed.retrieve_image(img_mat, sl.VIEW.LEFT, *res_args)
+                bgra = img_mat.get_data()
             if need_depth:
-                self.zed.retrieve_measure(self.depth_mat, sl.MEASURE.DEPTH)
-                depth = self.depth_mat.get_data()
+                self.zed.retrieve_measure(dep_mat, sl.MEASURE.DEPTH, *res_args)
+                depth = dep_mat.get_data()
                 if recording and self.session.writers:
                     self.zed.retrieve_measure(self.conf_mat, sl.MEASURE.CONFIDENCE)
                     conf = self.conf_mat.get_data()
@@ -1304,6 +1374,7 @@ class CaptureEngine(threading.Thread):
                     if rs is not None:
                         fi["svo_frame_ok"] = 1 if (rs.is_recording and rs.status) else 0
                         fi["_svo_compress_ms"] = safe(lambda: rs.average_compression_time)
+                        fi["_svo_compress_cur_ms"] = safe(lambda: rs.current_compression_time)
                 if s.writers:
                     # sl.Mat buffers are reused by the next grab -> copy for the writers
                     bgra_c = np.array(bgra, copy=True)
@@ -1330,11 +1401,17 @@ class CaptureEngine(threading.Thread):
         h, w = bgra.shape[:2]
         scale = min(1.0, (CONFIG["preview_max_width"] / 2) / w)
         pw, ph = max(1, int(w * scale)), max(1, int(h * scale))
-        rgb_small = cv2.resize(bgra, (pw, ph), interpolation=cv2.INTER_AREA)
+        if (pw, ph) == (w, h):  # already downscaled on the GPU
+            rgb_small = np.array(bgra, copy=True)
+        else:
+            rgb_small = cv2.resize(bgra, (pw, ph), interpolation=cv2.INTER_AREA)
         depth_small = None
         center_depth = None
         if depth is not None:
-            depth_small = cv2.resize(depth, (pw, ph), interpolation=cv2.INTER_NEAREST)
+            if depth.shape[:2] == (ph, pw):
+                depth_small = np.array(depth, copy=True)
+            else:
+                depth_small = cv2.resize(depth, (pw, ph), interpolation=cv2.INTER_NEAREST)
             cy0, cy1, cx0, cx1 = int(ph * 0.4), int(ph * 0.6), int(pw * 0.4), int(pw * 0.6)
             c = depth_small[cy0:cy1, cx0:cx1]
             c = c[np.isfinite(c)]
@@ -2012,7 +2089,9 @@ class ZEDTkApp:
                  f"effective {stats['effective_fps'] or 0:.2f} fps",
                  f"Missing camera frames (timestamp gaps): {stats['estimated_missing_camera_frames']}"]
         if session.svo_path:
-            lines.append(f"SVO2 frames OK: {stats['svo_frames_ok']}  failed: {stats['svo_frames_failed']}")
+            sv = v.get("svo", {})
+            lines.append(f"SVO2 frames in file: {sv.get('frames_in_file')} of {stats['frames_grabbed']} logged"
+                         + (f"  ({sv['missing_frames']} MISSING)" if sv.get("missing_frames") else ""))
         if session.writers:
             lines.append(f".mkv frames: {stats['mkv_frames_enqueued']}  dropped (backlog): "
                          f"{stats['mkv_frames_dropped_backlog']}")
@@ -2231,7 +2310,7 @@ class ZEDTkApp:
                          f"size {getattr(self, '_sess_size', 0) / 1e9:.2f} GB  "
                          f"markers → F9")
             lines.append(f"Missing camera frames {st['estimated_missing_camera_frames']}  "
-                         f"SVO ok/failed {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
+                         f"SVO status ok/not {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
                          f".mkv backlog {bl}/{bmax} dropped {st['mkv_frames_dropped_backlog']}")
             if any(w.failed for w in s.writers):
                 lines.append("⚠ an .mkv encoder FAILED – see events.log (SVO2 still recording)")

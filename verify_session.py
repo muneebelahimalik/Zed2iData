@@ -70,12 +70,50 @@ def svo_frames(path):
     return n
 
 
+def svo_timestamps(path):
+    """All image timestamps stored in an SVO/SVO2 file (decodes every frame; no depth)."""
+    import pyzed.sl as sl
+    ip = sl.InitParameters()
+    ip.set_from_svo_file(path)
+    ip.depth_mode = sl.DEPTH_MODE.NONE
+    ip.svo_real_time_mode = False
+    cam = sl.Camera()
+    if cam.open(ip) != sl.ERROR_CODE.SUCCESS:
+        return None
+    rt = sl.RuntimeParameters()
+    rt.enable_depth = False
+    out = []
+    while True:
+        err = cam.grab(rt)
+        if err == sl.ERROR_CODE.SUCCESS:
+            out.append(cam.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
+        elif "END_OF_SVOFILE" in str(err):
+            break
+        else:
+            continue
+    cam.close()
+    return out
+
+
+def compare_svo_to_csv(svo_path, csv_ts):
+    """-> dict with frames in file and logged frames missing from / extra in the SVO2."""
+    ts = svo_timestamps(svo_path)
+    if ts is None:
+        return {"error": "cannot open SVO2"}
+    svo_set, csv_set = set(ts), set(csv_ts)
+    return {"svo_frames": len(ts), "csv_frames": len(csv_ts),
+            "missing_in_svo": len(csv_set - svo_set), "extra_in_svo": len(svo_set - csv_set),
+            "first_missing": sorted(csv_set - svo_set)[:10]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session")
     ap.add_argument("--decode", action="store_true")
     ap.add_argument("--checksum", action="store_true")
     ap.add_argument("--check-copy", action="store_true")
+    ap.add_argument("--svo-full", action="store_true",
+                    help="decode the whole SVO2 and match every frames.csv timestamp (slow)")
     args = ap.parse_args()
     s = args.session
     rep = {"session": os.path.abspath(s), "checked": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -129,7 +167,8 @@ def main():
           f"rebuild with extract_svo.py --mkv if you need them")
     svo_bad = sum(1 for r in rows if r.get("svo_frame_ok") == "0")
     if svo_bad:
-        P(f"{svo_bad} frames reported as NOT stored in SVO2")
+        W(f"SDK status flagged {svo_bad} frames as not stored in SVO2 (advisory; the file "
+          f"frame count below is authoritative, --svo-full matches every timestamp)")
 
     rep["mkv"] = {}
     counts = set()
@@ -159,13 +198,18 @@ def main():
     if os.path.exists(svo):
         n = svo_frames(svo)
         rep["svo"] = {"bytes": os.path.getsize(svo), "frames": n}
-        ok_rows = sum(1 for r in rows if r.get("svo_frame_ok") == "1")
         if n is None:
             W("pyzed not installed: SVO2 frame count not checked")
         elif n < 0:
             P("SVO2 file cannot be opened")
-        elif ok_rows and n != ok_rows:
-            W(f"SVO2 has {n} frames, frames.csv reports {ok_rows} stored")
+        elif n < len(rows):
+            P(f"SVO2 has {n} frames but frames.csv logged {len(rows)}")
+        if args.svo_full and n is not None and n >= 0:
+            print("decoding SVO2 to match timestamps…")
+            cmp_ = compare_svo_to_csv(svo, ts)
+            rep["svo"]["timestamp_check"] = cmp_
+            if cmp_.get("missing_in_svo"):
+                P(f"{cmp_['missing_in_svo']} logged frames are not in the SVO2")
     elif (meta.get("capture") or {}).get("record_svo"):
         P("recording.svo2 missing although SVO recording was enabled")
 

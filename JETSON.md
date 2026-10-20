@@ -72,8 +72,32 @@ The SDK log line "Self-calibration was skipped due to low texture" is harmless w
 camera is pointing at a desk or wall. In the field, open the camera while it already
 looks at the soil and plants, so self-calibration has texture to work with.
 
-`--bench` records short test sessions at several settings. It then lists which
-settings ran with **zero lost frames on your Jetson**. Use one of those.
+`--bench` records 60 s at each of several settings. It then **decodes every SVO2 and
+matches each logged frame's hardware timestamp** against what is really stored in the
+file. Each setting gets one line:
+
+```
+[ OK ] HD2K@15 depth=NEURAL_LIGHT svo=LOSSLESS: 15.00 fps | camera frames missing 0 | SVO2 holds 900 of 900 logged (missing 0) | repeated 1 | CPU 63% | SVO compress 41/58 ms mean/max
+```
+
+* **camera frames missing**: gaps in the hardware timestamps, i.e. frames the
+  camera produced that never reached the recorder. **Must be 0.**
+* **SVO2 holds X of Y logged (missing N)**: frames logged but absent from the file.
+  **Must be 0.**
+* **repeated**: images the SDK handed out twice. They are skipped, harmless and not
+  lost.
+* **CPU / SVO compress**: lossless SVO compression runs on the CPU. If the mean
+  approaches the frame period (66 ms at 15 fps, 33 ms at 30 fps), frames start to drop.
+
+Use a setting from the "Loss-free on this machine" list. Test others with
+`--configs HD2K:15:NEURAL_LIGHT:LOSSLESS,HD1080:15:NONE:LOSSLESS`, and keep the test
+recordings with `--keep`.
+
+Measured on an AGX Orin (MAXN, JetPack 5.1, SDK 5.2): lossless SVO compression tops out
+around 100 Mpx/s. HD1080@30 (124 Mpx/s) cannot keep up, and live .mkv on top of SVO2
+costs about 15 % of the frames. HD2K@15 (82 Mpx/s) and HD1080@15 (62 Mpx/s) are within
+range. HD1080 is a crop of the same sensor, with the same mm/px as HD2K and 13 % less
+coverage.
 
 ## 2. Recording
 

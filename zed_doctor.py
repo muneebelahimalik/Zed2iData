@@ -243,57 +243,94 @@ def optimize_models(sl):
             report("FAIL", f"{mode}", str(err))
 
 
-def bench(sl, out, configs, seconds):
+def _cpu_times():
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return sum(v), v[3] + v[4]  # total, idle+iowait
+    except Exception:
+        return None
+
+
+def bench(sl, out, configs, seconds, keep=False):
+    import csv as _csv
     import queue as _q
     import Zed2i_video_datacollection as app
-    print("\n== Recording benchmark (real camera, real disk) ==")
+    from verify_session import compare_svo_to_csv
+    print("\n== Recording benchmark (real camera, real disk, SVO2 verified frame by frame) ==")
     problem = app.storage_problem(out)
     if problem:
         report("FAIL", "benchmark skipped", problem)
         return
+    os.makedirs(out, exist_ok=True)
     bench_dir = tempfile.mkdtemp(prefix="zed_bench_", dir=out)
     results = []
     for res, fps, depth, svo_mode, mkv in configs:
-        label = f"{res}@{fps} depth={depth} svo={svo_mode} mkv={'on' if mkv else 'off'}"
-        print(f"  {label}: {seconds:.0f} s…", flush=True)
+        label = f"{res}@{fps} depth={depth} svo={svo_mode}" + (" +mkv" if mkv else "")
+        print(f"\n  >>> {label}: recording {seconds:.0f} s…", flush=True)
         zed = sl.Camera()
-        ok, msg, rt, op, trk, _ = app.open_zed(zed, res, fps, depth, True)
+        ok, msg, rt, op, trk, _ = app.open_zed(zed, res, fps, depth, depth != "NONE")
         if not ok:
             report("FAIL", label, msg)
             continue
-        ev = _q.Queue()
-        eng = app.CaptureEngine(zed, rt, op["width"], op["height"], op["fps"], op["depth_enabled"], trk, ev)
+        eng = app.CaptureEngine(zed, rt, op["width"], op["height"], op["fps"], op["depth_enabled"],
+                                trk, _q.Queue())
         eng.start()
-        time.sleep(2)
+        time.sleep(3)
         opts = {"record_svo": True, "svo_compression": svo_mode, "record_mkv": mkv,
                 "depth_units_per_mm": 10, "confidence_scale": 100, "ram_buffer_gb": 1.0}
-        s = app.RecordingSession(bench_dir, {"plot_id": "bench"}, opts)
+        s = app.RecordingSession(bench_dir, {"plot_id": "bench_" + label.replace(" ", "_")}, opts)
         ok, msg = app.start_session(zed, eng, s, op)
         if not ok:
             report("FAIL", label, msg)
-        else:
-            time.sleep(seconds)
-            eng.submit("stop_session", timeout=30)
-            s.end_iso = app.now_iso()
-            s.finalize()
-            st = app.finish_session_metadata(s)
-            grab_ms = (sum(eng.grab_times) / len(eng.grab_times) * 1000) if eng.grab_times else 0
-            good = (st["estimated_missing_camera_frames"] == 0 and st["svo_frames_failed"] == 0
-                    and (st["effective_fps"] or 0) >= fps * 0.97)
-            mkv_txt = f", mkv dropped {st['mkv_frames_dropped_backlog']}" if mkv else ""
-            report("OK" if good and not st["mkv_frames_dropped_backlog"] else "WARN", label,
-                   f"{st['effective_fps'] or 0:.1f} fps, missing {st['estimated_missing_camera_frames']}, "
-                   f"SVO failed {st['svo_frames_failed']}{mkv_txt}, grab {grab_ms:.0f} ms")
-            results.append((label, good and not st["mkv_frames_dropped_backlog"]))
+            eng.stop_event.set()
+            eng.join(timeout=30)
+            zed.close()
+            continue
+        c0 = _cpu_times()
+        time.sleep(seconds)
+        c1 = _cpu_times()
+        eng.submit("stop_session", timeout=30)
         eng.stop_event.set()
         eng.join(timeout=30)
         zed.close()
-    shutil.rmtree(bench_dir, ignore_errors=True)
+        s.end_iso = app.now_iso()
+        s.finalize()
+        st = app.finish_session_metadata(s)
+        cpu = (100.0 * (1 - (c1[1] - c0[1]) / max(1, c1[0] - c0[0]))) if c0 and c1 else None
+        with open(s.csv_path, newline="") as f:
+            csv_ts = [int(r["image_timestamp_ns"]) for r in _csv.DictReader(f) if r["image_timestamp_ns"]]
+        print("      verifying SVO2 frame by frame…", flush=True)
+        cmp_ = compare_svo_to_csv(s.svo_path, csv_ts)
+        cam_missing = st["estimated_missing_camera_frames"]
+        svo_missing = cmp_.get("missing_in_svo", -1)
+        lossless = cam_missing == 0 and svo_missing == 0
+        comp = st.get("svo_compression_ms_mean")
+        report("OK" if lossless else "WARN", label,
+               f"{st['effective_fps'] or 0:.2f} fps | camera frames missing {cam_missing} | "
+               f"SVO2 holds {cmp_.get('svo_frames')} of {cmp_.get('csv_frames')} logged "
+               f"(missing {svo_missing}) | repeated {st['duplicate_frames_skipped']} | "
+               f"CPU {cpu or 0:.0f}% | SVO compress "
+               + (f"{comp:.0f}/{st.get('svo_compression_ms_max') or 0:.0f} ms mean/max" if comp else "n/a")
+               + (f" | mkv dropped {st['mkv_frames_dropped_backlog']}" if mkv else ""))
+        results.append((label, lossless and not st["mkv_frames_dropped_backlog"]))
+    if keep:
+        print(f"\n  benchmark sessions kept in {bench_dir}")
+    else:
+        shutil.rmtree(bench_dir, ignore_errors=True)
     best = [l for l, g in results if g]
-    print("\n  Settings with zero loss on this machine:" if best else
-          "\n  No tested setting was loss-free; try a lower resolution or --svo-compression H265_LOSSLESS")
+    print("\n  Loss-free on this machine:" if best else "\n  No tested setting was loss-free.")
     for l in best:
         print(f"    - {l}")
+
+
+def parse_configs(text, sl):
+    """'HD2K:15:NEURAL_LIGHT:LOSSLESS[:mkv],HD1080:15:NONE:LOSSLESS' -> list of tuples."""
+    out = []
+    for item in text.split(","):
+        p = item.strip().split(":")
+        out.append((p[0].upper(), int(p[1]), p[2].upper(), p[3].upper(), len(p) > 4 and p[4] == "mkv"))
+    return out
 
 
 def main():
@@ -302,7 +339,10 @@ def main():
     ap.add_argument("--out", default=app.CONFIG["base_directory"], help="where recordings will be saved")
     ap.add_argument("--optimize", action="store_true", help="pre-build NEURAL models (one-time)")
     ap.add_argument("--bench", action="store_true", help="run recording benchmarks")
-    ap.add_argument("--seconds", type=float, default=20)
+    ap.add_argument("--seconds", type=float, default=60, help="per benchmark setting")
+    ap.add_argument("--configs", help="custom list, e.g. HD2K:15:NEURAL_LIGHT:LOSSLESS,HD1080:15:NONE:LOSSLESS"
+                                      " (append :mkv to also write live .mkv)")
+    ap.add_argument("--keep", action="store_true", help="keep the benchmark recordings")
     ap.add_argument("--quick", action="store_true", help="skip the 1 GB disk test")
     a = ap.parse_args()
 
@@ -320,13 +360,14 @@ def main():
         optimize_models(sl)
     if sl and a.bench:
         light = "NEURAL_LIGHT" if hasattr(sl.DEPTH_MODE, "NEURAL_LIGHT") else "NEURAL"
-        configs = [("HD2K", 15, light, "LOSSLESS", False),
-                   ("HD2K", 15, "NEURAL", "LOSSLESS", False),
-                   ("HD1080", 15, light, "LOSSLESS", False),
-                   ("HD1080", 30, light, "LOSSLESS", False),
-                   ("HD2K", 15, light, "LOSSLESS", True)]
-        configs = list(dict.fromkeys(configs))  # light == NEURAL on SDKs without NEURAL_LIGHT
-        bench(sl, a.out, configs, a.seconds)
+        if a.configs:
+            configs = parse_configs(a.configs, sl)
+        else:
+            configs = [("HD2K", 15, light, "LOSSLESS", False),
+                       ("HD2K", 15, "NONE", "LOSSLESS", False),
+                       ("HD1080", 15, light, "LOSSLESS", False),
+                       ("HD2K", 15, light, "H265_LOSSLESS", False)]
+        bench(sl, a.out, list(dict.fromkeys(configs)), a.seconds, a.keep)
 
     n_fail = RESULTS.count("FAIL")
     n_warn = RESULTS.count("WARN")

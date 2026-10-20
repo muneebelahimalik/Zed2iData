@@ -195,7 +195,7 @@ def main():
         tilt = fi.get("tilt_from_nadir_deg")
         line = (f"\r{time.monotonic() - t_start:7.1f}s  frames {st['frames_grabbed']:6d}  "
                 f"missing {st['estimated_missing_camera_frames']:3d}  "
-                f"SVO ok/fail {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
+                f"SVO status ok/not {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
                 + (f"mkv backlog {bl}/{bmax} drop {st['mkv_frames_dropped_backlog']}  " if session.writers else "")
                 + (f"speed {spd:.2f} m/s  " if spd is not None else "")
                 + (f"dist {st['distance_travelled_m']:.1f} m  " if st['distance_travelled_m'] else "")
@@ -223,8 +223,10 @@ def main():
     print(f"\n{'✔' if v.get('all_ok') else '⚠'} Saved {session.dir}")
     print(f"  frames {stats['frames_grabbed']}, {stats['duration_s']:.1f} s, "
           f"{stats['effective_fps'] or 0:.2f} fps effective")
+    sv = v.get("svo", {})
     print(f"  missing camera frames {stats['estimated_missing_camera_frames']}, "
-          f"SVO ok/failed {stats['svo_frames_ok']}/{stats['svo_frames_failed']}")
+          f"SVO2 frames in file {sv.get('frames_in_file')} of {stats['frames_grabbed']} logged, "
+          f"repeated frames skipped {stats['duplicate_frames_skipped']}")
     for name, sv in v.get("streams", {}).items():
         print(f"  {name}: {sv['frames_in_file']} in file / {sv['frames_sent']} sent"
               f"{'  ERROR ' + str(sv['error']) if sv['failed'] else ''}")
