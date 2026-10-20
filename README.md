@@ -10,6 +10,8 @@ report anything that goes wrong.
 | `Zed2i_video_datacollection.py` | GUI recorder (run this in the field) |
 | `extract_svo.py` | Recompute depth from the SVO2 file and export frames, depth, confidence, poses, point clouds, or a gap-free `.mkv` set |
 | `verify_session.py` | Check a session after recording (frame counts, gaps, CRCs, checksums for backups) |
+| `session_reader.py` | Standalone Python reader for sessions (numpy + ffmpeg): decoding, joins, backprojection, world transform |
+| `DATA_SPEC.md` | **Full data specification**: every file, format, code and column, plus guidance for extraction and localization |
 | `video.py` | Older script, kept for reference |
 
 ## Install
