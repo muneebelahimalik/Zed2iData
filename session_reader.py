@@ -231,11 +231,17 @@ class Session:
         R, t = p
         return (pts_world_mm - t) @ R
 
-    def row_by_timestamp(self, ts_ns: int, tol_ns: int = 2_000_000):
-        """frames.csv row whose image_timestamp_ns matches (for joining SVO2 extractions)."""
+    def row_by_timestamp(self, ts_ns: int, tol_ns: int = None):
+        """frames.csv row nearest to an SVO2 timestamp (for joining extract_svo.py output).
+
+        SVO2 playback timestamps can differ slightly from the live ones (precision), so the
+        nearest row within 30 % of a frame period is returned (None if there is none).
+        """
         if not hasattr(self, "_ts_index"):
             self._ts = np.array([r["image_timestamp_ns"] or 0 for r in self.frames], dtype=np.int64)
             self._ts_index = True
+        if tol_ns is None:
+            tol_ns = int(0.3 * 1e9 / self.fps)
         i = int(np.argmin(np.abs(self._ts - ts_ns)))
         return self.frames[i] if abs(int(self._ts[i]) - ts_ns) <= tol_ns else None
 

@@ -103,15 +103,54 @@ def svo_timestamps(path):
     return out
 
 
+def match_timestamps(live_ts, svo_ts):
+    """Match logged (live) timestamps to SVO2 playback timestamps.
+
+    The SVO2 may store timestamps with a different precision or a constant offset from
+    the live get_timestamp() values, so frames are matched to the nearest timestamp
+    within 30 % of a frame period after removing the median offset.
+    """
+    a = sorted(int(x) for x in live_ts)
+    b = sorted(int(x) for x in svo_ts)
+    if not a or not b:
+        return {"matched": 0, "missing_in_svo": len(a), "extra_in_svo": len(b)}
+    diffs = [y - x for x, y in zip(a, a[1:])]
+    period = sorted(diffs)[len(diffs) // 2] if diffs else 66_666_667
+    tol = int(0.3 * period)
+    k = min(len(a), len(b), 50)
+    offset = sorted(b[i] - a[i] for i in range(k))[k // 2]   # robust constant offset
+    i = j = matched = exact = 0
+    resid = []
+    missing = []
+    while i < len(a) and j < len(b):
+        d = b[j] - (a[i] + offset)
+        if abs(d) <= tol:
+            matched += 1
+            exact += (b[j] == a[i])
+            resid.append(abs(d))
+            i += 1
+            j += 1
+        elif d < 0:
+            j += 1
+        else:
+            missing.append(a[i])
+            i += 1
+    missing += a[i:]
+    return {"matched": matched, "missing_in_svo": len(a) - matched, "extra_in_svo": len(b) - matched,
+            "exact_timestamp_matches": exact, "offset_ns": offset,
+            "max_residual_ms": (max(resid) / 1e6) if resid else None,
+            "first_missing": missing[:10], "period_ms": period / 1e6}
+
+
 def compare_svo_to_csv(svo_path, csv_ts):
     """-> dict with frames in file and logged frames missing from / extra in the SVO2."""
     ts = svo_timestamps(svo_path)
     if ts is None:
         return {"error": "cannot open SVO2"}
-    svo_set, csv_set = set(ts), set(csv_ts)
-    return {"svo_frames": len(ts), "csv_frames": len(csv_ts),
-            "missing_in_svo": len(csv_set - svo_set), "extra_in_svo": len(svo_set - csv_set),
-            "first_missing": sorted(csv_set - svo_set)[:10]}
+    out = {"svo_frames": len(ts), "csv_frames": len(csv_ts), "svo_first_ts": ts[:3],
+           "csv_first_ts": sorted(csv_ts)[:3]}
+    out.update(match_timestamps(csv_ts, ts))
+    return out
 
 
 def main():

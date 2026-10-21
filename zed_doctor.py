@@ -310,6 +310,8 @@ def bench(sl, out, configs, seconds, keep=False):
                f"{st['effective_fps'] or 0:.2f} fps | camera frames missing {cam_missing} | "
                f"SVO2 holds {cmp_.get('svo_frames')} of {cmp_.get('csv_frames')} logged "
                f"(missing {svo_missing}) | repeated {st['duplicate_frames_skipped']} | "
+               f"ts offset {(cmp_.get('offset_ns') or 0) / 1e6:.3f} ms, residual <= "
+               f"{cmp_.get('max_residual_ms') or 0:.3f} ms, exact {cmp_.get('exact_timestamp_matches')} | "
                f"CPU {cpu or 0:.0f}% | SVO compress "
                + (f"{comp:.0f}/{st.get('svo_compression_ms_max') or 0:.0f} ms mean/max" if comp else "n/a")
                + (f" | mkv dropped {st['mkv_frames_dropped_backlog']}" if mkv else ""))

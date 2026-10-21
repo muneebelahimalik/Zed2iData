@@ -108,7 +108,7 @@ CONFIG = {
     "preview_max_width": 1400,
     "preview_interval_s": 0.10,
     "gui_poll_ms": 50,
-    "camera_settings_poll_frames": 5,
+    "camera_settings_poll_frames": 3,   # one setting per poll, round-robin (5 settings)
     "csv_flush_interval_s": 1.0,
 
     # Motion planning defaults (editable in the GUI).
@@ -1262,18 +1262,26 @@ class CaptureEngine(threading.Thread):
         return True, "ok"
 
     # ---- helpers ------------------------------------------------------------
-    def _poll_camera_settings(self):
-        g = lambda s: zed_get_setting(self.zed, getattr(sl.VIDEO_SETTINGS, s, None)) \
-            if hasattr(sl.VIDEO_SETTINGS, s) else None
-        exp = g("EXPOSURE")
-        self.cam_settings = {
-            "exposure_pct": exp,
-            "exposure_ms_approx": (exp / 100.0 * self.period_ms) if exp is not None else None,
-            "gain": g("GAIN"),
-            "aec_agc": g("AEC_AGC"),
-            "wb_temp_k": g("WHITEBALANCE_TEMPERATURE"),
-            "wb_auto": g("WHITEBALANCE_AUTO"),
-        }
+    _SETTINGS = (("exposure_pct", "EXPOSURE"), ("gain", "GAIN"), ("aec_agc", "AEC_AGC"),
+                 ("wb_temp_k", "WHITEBALANCE_TEMPERATURE"), ("wb_auto", "WHITEBALANCE_AUTO"))
+
+    def _poll_camera_settings(self, only_next: bool = False):
+        """Read camera settings over USB (~4 ms each on a Jetson).
+
+        only_next=True reads ONE setting (round-robin) so the capture loop never spends
+        ~20 ms in a burst of USB control transfers.
+        """
+        items = self._SETTINGS
+        if only_next:
+            self._settings_rr = (getattr(self, "_settings_rr", -1) + 1) % len(items)
+            items = (items[self._settings_rr],)
+        new = dict(self.cam_settings)
+        for key, name in items:
+            if hasattr(sl.VIDEO_SETTINGS, name):
+                new[key] = zed_get_setting(self.zed, getattr(sl.VIDEO_SETTINGS, name))
+        exp = new.get("exposure_pct")
+        new["exposure_ms_approx"] = (exp / 100.0 * self.period_ms) if exp is not None else None
+        self.cam_settings = new
 
     def _read_pose(self, fi, ts):
         state = self.zed.get_position(self.pose, sl.REFERENCE_FRAME.WORLD)
@@ -1360,7 +1368,7 @@ class CaptureEngine(threading.Thread):
             sys_ns = time.time_ns()
             if self.grab_idx % CONFIG["camera_settings_poll_frames"] == 0:
                 t0 = time.perf_counter()
-                self._poll_camera_settings()
+                self._poll_camera_settings(only_next=True)
                 steps["camera_settings"] = time.perf_counter() - t0
 
             recording = self.session is not None
