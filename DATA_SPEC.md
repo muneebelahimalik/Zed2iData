@@ -139,7 +139,7 @@ UTF-8 with a header row. An empty cell means "not available" for that frame.
 | `mkv_written` | `1` if this frame is in all three .mkv files, `0` if it was dropped from them because of encoder backlog (it is still in the SVO2) |
 | `mkv_frame_idx` | index of this frame inside the .mkv files (blank when `mkv_written=0`). **Use this to map a decoded .mkv frame to its row.** The values are contiguous: 0 … N−1 |
 | `svo_frame_ok` | SDK recording-status flag for this frame (`1` stored / `0` not stored, blank if SVO2 disabled). **Advisory only**: the SDK often reports `0` for the first frame. The authoritative check is `session_metadata.json → verification.svo.frames_in_file` vs `frames_logged`, or `verify_session.py --svo-full`, which matches every timestamp |
-| `image_timestamp_ns` | ZED hardware image timestamp (UTC epoch, ns). **This is the universal join key**: the same value appears in SVO2 extractions (`extract_svo.py → index.csv timestamp_ns`) |
+| `image_timestamp_ns` | ZED hardware image timestamp (UTC epoch, ns). **This is the universal join key** with SVO2 extractions (`extract_svo.py → index.csv timestamp_ns`). The SVO2 stores this value **rounded to the microsecond** (measured: offset ≈ −0.001 ms, residual 0 over 900+ frames, ZED SDK 5.2), so join on the **nearest timestamp within a tolerance** (e.g. ±1 ms, or 30 % of a frame period), never on exact equality. `session_reader.Session.row_by_timestamp()` does this |
 
 ### 6.2 Timing and integrity
 
@@ -279,7 +279,8 @@ distance Z is `Z / fx` mm per pixel, about 0.94 mm/px at 1 m for HD2K
   `--every-mm D` (one frame per D mm of travel), `--start`, `--end`.
 * **The tracking world frame in `index.csv` is not the same as in `frames.csv`.**
   Extraction re-runs tracking, so its origin is the first extracted frame. Join
-  extractions to the recording by `timestamp_ns`, never by pose.
+  extractions to the recording by nearest `timestamp_ns` (SVO2 timestamps are the live
+  ones rounded to 1 µs), never by pose.
 
 ## 9. Other files
 
