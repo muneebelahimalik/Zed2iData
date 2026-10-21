@@ -101,6 +101,13 @@ coverage.
 
 ## 2. Recording
 
+The GUI runs the camera and recording in a **separate capture process**. Redrawing the
+preview, moving the window or an open dialog can therefore never delay a frame (in an
+earlier single-process version this cost about 1 frame per 25 s). If the window crashes
+or is killed during a recording, the capture process still stops and saves the session.
+**Ctrl+C** in the terminal stops and saves any recording, then closes the camera
+cleanly.
+
 **With a monitor:** double-click **WeedScan** on the desktop, or run
 `./jetson/run_weedscan.sh`. The GUI is the same as on Windows, and its log is saved
 to `~/ZED_Data/logs/`.

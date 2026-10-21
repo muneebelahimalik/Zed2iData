@@ -41,11 +41,13 @@ import datetime
 import glob
 import json
 import math
+import multiprocessing
 import os
 import platform
 import queue
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1673,6 +1675,270 @@ def jetson_info() -> dict:
             info["nvpmodel"] = " ".join(r.split())
     return info
 
+
+###############################################################################
+# Capture process: the camera, capture loop and recording run in their OWN process
+# so the GUI (Tk redraws, dialogs, window moves) can never delay a grab().
+###############################################################################
+
+RES_SIZES = {"HD2K": (2208, 1242), "HD1080": (1920, 1080), "HD720": (1280, 720), "VGA": (672, 376)}
+
+
+def _session_summary(s, stats) -> dict:
+    return {"dir": s.dir, "has_svo": bool(s.svo_path), "has_writers": bool(s.writers),
+            "stats": stats, "verification": s.verification}
+
+
+def capture_server(conn, status_q, event_q, config: dict) -> None:
+    """Entry point of the capture process (started with the 'spawn' method)."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C is handled by the GUI process
+    except Exception:
+        pass
+    CONFIG.update(config)
+    raise_process_priority()
+    zed = sl.Camera()
+    ui = queue.Queue()
+    st = {"engine": None, "session": None, "open_params": None, "finalizers": []}
+
+    def finish(reason: str) -> None:
+        s, eng = st["session"], st["engine"]
+        st["session"] = None
+        if s is None:
+            return
+        if eng is not None:
+            eng.submit("stop_session", timeout=30)
+        s.end_iso = now_iso()
+        s.log_event("INFO", f"recording stopped ({reason}); finalizing files…")
+
+        def run():
+            try:
+                s.finalize()
+            except Exception as e:
+                s.log_event("ERROR", f"finalize failed: {e}")
+            stats = finish_session_metadata(s)
+            event_q.put(("finalized", _session_summary(s, stats)))
+        t = threading.Thread(target=run, name="finalize", daemon=False)
+        t.start()
+        st["finalizers"].append(t)
+
+    def shutdown() -> None:
+        finish("camera closed")
+        for t in st["finalizers"]:
+            t.join()
+        eng = st["engine"]
+        if eng is not None:
+            eng.stop_event.set()
+            eng.join(timeout=30)
+        st["engine"] = None
+        try:
+            zed.close()
+        except Exception:
+            pass
+
+    def handle(name, args):
+        eng = st["engine"]
+        if name == "open":
+            res_name, fps, depth_choice, tracking = args
+            ok, msg, rt, op, trk, warnings = open_zed(zed, res_name, fps, depth_choice, tracking)
+            if not ok:
+                return False, msg, None, False, [], None
+            st["open_params"] = op
+            st["engine"] = CaptureEngine(zed, rt, op["width"], op["height"], op["fps"],
+                                         op["depth_enabled"], trk, ui)
+            st["engine"].start()
+            return True, "ok", op, trk, warnings, camera_info_dict(zed)
+        if name == "submit":
+            cmd, cargs = args
+            return eng.submit(cmd, *cargs) if eng else (False, "camera not open")
+        if name == "start_recording":
+            base, field_info, opts, plan, bench = args
+            if st["session"] is not None or eng is None:
+                return False, "already recording or camera not open", None
+            s = RecordingSession(base, field_info, opts)
+            ok, msg = start_session(zed, eng, s, st["open_params"], speed_plan=plan,
+                                    disk_bench_mb_s=bench)
+            if not ok:
+                return False, msg, s.dir
+            st["session"] = s
+            return True, "ok", s.dir
+        if name == "stop_recording":
+            finish(args[0])
+            return True, "ok"
+        if name == "marker":
+            s = st["session"]
+            if s is None or eng is None:
+                return False, "not recording"
+            with eng.latest_lock:
+                fi = dict(eng.latest.get("fi") or {})
+            s.add_marker(max(0, s.frames - 1), fi.get("image_timestamp_ns"), args[0])
+            return True, "ok"
+        if name == "log":
+            if st["session"] is not None:
+                st["session"].log_event(*args)
+            return True, "ok"
+        if name == "shutdown":
+            shutdown()
+            return True, "ok"
+        return False, f"unknown command {name}"
+
+    last_status = 0.0
+    last_preview = None
+    while True:
+        try:
+            if conn.poll(0.02):
+                name, args = conn.recv()
+                try:
+                    result = handle(name, args)
+                except Exception as e:
+                    result = (False, f"{type(e).__name__}: {e}")
+                conn.send(result)
+                if name == "shutdown":
+                    break
+        except (EOFError, OSError, BrokenPipeError):
+            # The GUI process is gone (crashed / killed): save what was recorded.
+            print("[WARN] GUI process disappeared - stopping and saving the recording")
+            shutdown()
+            break
+        while True:
+            try:
+                event_q.put(ui.get_nowait())
+            except queue.Empty:
+                break
+        eng = st["engine"]
+        now = time.monotonic()
+        if eng is not None and now - last_status >= 0.1:
+            last_status = now
+            with eng.latest_lock:
+                latest = dict(eng.latest)
+            snap = {"fi": latest.get("fi"), "grab_ms": latest.get("grab_ms"),
+                    "current_fps": latest.get("current_fps"), "cam_settings": dict(eng.cam_settings)}
+            rgb = latest.get("rgb")
+            if rgb is not None and rgb is not last_preview:
+                last_preview = rgb
+                snap["rgb"] = np.ascontiguousarray(rgb[:, :, :3])
+                d = latest.get("depth")
+                snap["depth"] = d.astype(np.float16) if d is not None else None
+            s = st["session"]
+            if s is not None:
+                snap["session"] = {"stats": s.stats(), "backlog": s.backlog(), "frames": s.frames,
+                                   "writers_failed": any(w.failed for w in s.writers)}
+            try:
+                status_q.put_nowait(snap)
+            except queue.Full:
+                pass
+    for t in st["finalizers"]:
+        t.join()
+
+
+class RemoteEngine:
+    """GUI-side handle of the capture process (same attributes the GUI used before)."""
+
+    def __init__(self, ui_events: queue.Queue):
+        ctx = multiprocessing.get_context("spawn")  # never fork a process that holds CUDA
+        self._conn, child = ctx.Pipe()
+        self._status = ctx.Queue(maxsize=4)
+        self._events = ctx.Queue()
+        self.proc = ctx.Process(target=capture_server, name="weedscan-capture",
+                                args=(child, self._status, self._events, dict(CONFIG)))
+        self.proc.start()
+        self._lock = threading.Lock()
+        self.ui_events = ui_events
+        self.latest_lock = threading.Lock()
+        self.latest = {}
+        self.cam_settings = {}
+        self.session_status = None
+        self.width = self.height = self.fps = None
+        self.depth_enabled = False
+
+    def alive(self) -> bool:
+        return self.proc.is_alive()
+
+    def call(self, name, *args, timeout=60.0, tick=None):
+        with self._lock:
+            try:
+                self._conn.send((name, args))
+            except (BrokenPipeError, OSError):
+                return (False, "capture process is not running")
+            deadline = time.monotonic() + timeout
+            while not self._conn.poll(0.05):
+                if tick:
+                    tick()
+                if not self.proc.is_alive():
+                    return (False, "capture process stopped unexpectedly")
+                if time.monotonic() > deadline:
+                    return (False, f"capture process did not answer '{name}' in {timeout:.0f} s")
+            try:
+                return self._conn.recv()
+            except (EOFError, OSError) as e:
+                return (False, f"lost connection to the capture process: {e}")
+
+    def submit(self, name, *args, timeout=15.0):
+        return self.call("submit", name, args, timeout=timeout)
+
+    def pump(self) -> None:
+        """Pull status snapshots and events from the capture process (GUI thread)."""
+        while True:
+            try:
+                snap = self._status.get_nowait()
+            except queue.Empty:
+                break
+            with self.latest_lock:
+                if "rgb" in snap:
+                    d = snap.get("depth")
+                    self.latest["rgb"] = snap["rgb"]
+                    self.latest["depth"] = d.astype(np.float32) if d is not None else None
+                    self.latest["_shown"] = False
+                for k in ("fi", "grab_ms", "current_fps"):
+                    self.latest[k] = snap.get(k)
+            self.cam_settings = snap.get("cam_settings") or self.cam_settings
+            self.session_status = snap.get("session")
+        while True:
+            try:
+                self.ui_events.put(self._events.get_nowait())
+            except queue.Empty:
+                break
+
+    def shutdown(self, tick=None) -> None:
+        if self.proc.is_alive():
+            self.call("shutdown", timeout=3600, tick=tick)
+        self.proc.join(timeout=30)
+        if self.proc.is_alive():
+            self.proc.terminate()
+
+
+class RemoteSession:
+    """GUI-side view of the recording session running in the capture process."""
+
+    def __init__(self, engine: RemoteEngine, directory: str):
+        self.engine = engine
+        self.dir = directory
+
+    def _status(self):
+        return self.engine.session_status or {}
+
+    @property
+    def frames(self) -> int:
+        return self._status().get("frames", 0)
+
+    @property
+    def writers_failed(self) -> bool:
+        return bool(self._status().get("writers_failed"))
+
+    def stats(self) -> dict:
+        st = self._status().get("stats")
+        return st or {"duration_s": 0.0, "frames_grabbed": 0, "estimated_missing_camera_frames": 0,
+                      "svo_frames_ok": 0, "svo_frames_failed": 0, "mkv_frames_dropped_backlog": 0}
+
+    def backlog(self):
+        return tuple(self._status().get("backlog") or (0, 0))
+
+    def add_marker(self, text: str):
+        return self.engine.call("marker", text, timeout=10)
+
+    def log_event(self, level: str, msg: str):
+        return self.engine.call("log", level, msg, timeout=10)
+
 ###############################################################################
 # GUI
 ###############################################################################
@@ -1682,10 +1948,9 @@ class ZEDTkApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.zed = sl.Camera()
         self.camera_opened = False
-        self.engine: CaptureEngine | None = None
-        self.session: RecordingSession | None = None
+        self.engine: RemoteEngine | None = None
+        self.session: RemoteSession | None = None
         self.finalizing = False
         self.ui_events = queue.Queue()
         self.cam_info = None
@@ -1912,26 +2177,27 @@ class ZEDTkApp:
                          f"NEURAL model on a new device optimizes it and can take 5-20 min; run "
                          f"zed_doctor.py --optimize beforehand)")
         self.root.update_idletasks()
-        ok, msg, rt, self.open_params, tracking_ok, warnings = open_zed(
-            self.zed, res_name, fps, depth_choice, tracking)
+        # Fit the side-by-side preview on screen (controls take ~620 px of height).
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        rw, rh = RES_SIZES.get(res_name, (1920, 1080))
+        CONFIG["preview_max_width"] = int(max(480, min(1400, sw - 40, (sh - 700) * 2 * rw / rh)))
+
+        self.engine = RemoteEngine(self.ui_events)
+        res = self.engine.call("open", res_name, fps, depth_choice, tracking, timeout=3600,
+                               tick=self.root.update)
+        ok, msg = res[0], res[1]
         if not ok:
+            self.engine.shutdown()
+            self.engine = None
             messagebox.showerror("ZED open error", f"Cannot open ZED camera:\n{msg}")
             self._set_status("Camera open failed")
             return
+        _, _, self.open_params, tracking_ok, warnings, self.cam_info = res
         for w in warnings:
             messagebox.showwarning("Camera", w)
-        self.cam_info = camera_info_dict(self.zed)
-        cfg = self.zed.get_camera_information().camera_configuration
-
-        # Fit the side-by-side preview on screen (controls take ~620 px of height).
-        self.root.update_idletasks()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        aspect = cfg.resolution.width / max(1, cfg.resolution.height)
-        CONFIG["preview_max_width"] = int(max(480, min(1400, sw - 40, (sh - 700) * 2 * aspect)))
-
-        self.engine = CaptureEngine(self.zed, rt, cfg.resolution.width, cfg.resolution.height,
-                                    cfg.fps, depth_enabled, tracking_ok, self.ui_events)
-        self.engine.start()
+        op = self.open_params
+        self.engine.width, self.engine.height, self.engine.fps = op["width"], op["height"], op["fps"]
+        self.engine.depth_enabled = op["depth_enabled"]
         self.camera_opened = True
         for w in (self.res_menu, self.fps_menu, self.depth_menu, self.track_chk):
             w.config(state=tk.DISABLED)
@@ -1939,7 +2205,7 @@ class ZEDTkApp:
         self.close_cam_btn.config(state=tk.NORMAL)
         self.start_btn.config(state=tk.NORMAL)
         self._set_status(f"Camera open: serial {self.cam_info['serial_number']} "
-                         f"{cfg.resolution.width}x{cfg.resolution.height}@{cfg.fps}")
+                         f"{op['width']}x{op['height']}@{op['fps']} (capture process {self.engine.proc.pid})")
 
     def close_camera(self):
         if not self.camera_opened:
@@ -1947,12 +2213,9 @@ class ZEDTkApp:
         if self.session is not None:
             self.stop_recording(block=True)
         self._wait_finalize()
-        self.engine.stop_event.set()
-        self.engine.join(timeout=30)
-        if self.engine.is_alive():
-            print("[WARN] capture thread still running; closing camera anyway")
+        self._set_status("Closing camera…")
+        self.engine.shutdown(tick=self.root.update)
         self.engine = None
-        self.zed.close()
         self.camera_opened = False
         for w in (self.res_menu, self.fps_menu, self.depth_menu):
             w.config(state="readonly")
@@ -2084,17 +2347,12 @@ class ZEDTkApp:
             "ram_buffer_gb": CONFIG["ram_buffer_gb"],
         }
         field_info = self._collect_field_info()
-        try:
-            session = RecordingSession(base, field_info, opts)
-        except Exception as e:
-            messagebox.showerror("Session", f"Cannot create session folder:\n{e}")
-            return
-        ok, msg = start_session(self.zed, self.engine, session, self.open_params,
-                                speed_plan=self._plan(), disk_bench_mb_s=self.disk_bench_mb_s)
+        ok, msg, sdir = self.engine.call("start_recording", base, field_info, opts, self._plan(),
+                                         self.disk_bench_mb_s, timeout=120, tick=self.root.update)
         if not ok:
             messagebox.showerror("Recording", f"Could not start recording:\n{msg}")
             return
-
+        session = RemoteSession(self.engine, sdir)
         self.session = session
         self.last_size = (time.monotonic(), 0)
         self.write_rate_mb_s = None
@@ -2108,55 +2366,45 @@ class ZEDTkApp:
     def stop_recording(self, block: bool = False, reason: str = "operator"):
         if self.session is None or not self.engine:
             return
-        ok, session = self.engine.submit("stop_session", timeout=30)
-        if not ok:
-            session = self.session
         self.session = None
-        session.end_iso = now_iso()
-        session.log_event("INFO", f"recording stopped ({reason}); finalizing files…")
         self.stop_btn.config(state=tk.DISABLED)
         self.finalizing = True
         self._set_status("Finalizing – writing remaining frames, do not unplug the drive…")
-
-        def _finish():
-            try:
-                session.finalize()
-            except Exception as e:
-                session.log_event("ERROR", f"finalize failed: {e}")
-            self.ui_events.put(("finalized", session))
-
-        t = threading.Thread(target=_finish, name="finalize", daemon=False)
-        t.start()
-        self.finalize_thread = t
+        ok, msg = self.engine.call("stop_recording", reason, timeout=60, tick=self.root.update)
+        if not ok:
+            messagebox.showerror("Stop recording", str(msg))
         if block:
-            t.join()
+            self._wait_finalize()
 
     def _wait_finalize(self):
-        t = getattr(self, "finalize_thread", None)
-        if t is not None and t.is_alive():
+        """Keep the window responsive until the capture process reports 'finalized'."""
+        if self.finalizing:
             self._set_status("Waiting for files to be finalized…")
+        while self.finalizing and self.engine is not None and self.engine.alive():
+            self.engine.pump()
+            self._drain_ui_events()
             self.root.update()
-            t.join()
+            time.sleep(0.05)
         self._drain_ui_events()
 
-    def _on_finalized(self, session: RecordingSession):
-        stats = finish_session_metadata(session)
+    def _on_finalized(self, summary: dict):
+        stats = summary["stats"]
         self.finalizing = False
         keep_system_awake(False)
         play_wav_async(CONFIG["wave_stop_path"])
         if self.camera_opened:
             self.start_btn.config(state=tk.NORMAL)
 
-        v = session.verification
-        lines = [f"Saved: {session.dir}",
+        v = summary["verification"]
+        lines = [f"Saved: {summary['dir']}",
                  f"Frames: {stats['frames_grabbed']}  duration {stats['duration_s']:.1f} s  "
                  f"effective {stats['effective_fps'] or 0:.2f} fps",
                  f"Missing camera frames (timestamp gaps): {stats['estimated_missing_camera_frames']}"]
-        if session.svo_path:
+        if summary["has_svo"]:
             sv = v.get("svo", {})
             lines.append(f"SVO2 frames in file: {sv.get('frames_in_file')} of {stats['frames_grabbed']} logged"
                          + (f"  ({sv['missing_frames']} MISSING)" if sv.get("missing_frames") else ""))
-        if session.writers:
+        if summary["has_writers"]:
             lines.append(f".mkv frames: {stats['mkv_frames_enqueued']}  dropped (backlog): "
                          f"{stats['mkv_frames_dropped_backlog']}")
             for name, sv in v.get("streams", {}).items():
@@ -2166,7 +2414,7 @@ class ZEDTkApp:
             lines.append(f"Distance {stats['distance_travelled_m']:.2f} m, mean speed "
                          f"{stats['mean_speed_m_s'] or 0:.3f} m/s")
         msg = "\n".join(lines)
-        self._set_status(("✔ " if v.get("all_ok") else "⚠ ") + f"Saved {session.dir}")
+        self._set_status(("✔ " if v.get("all_ok") else "⚠ ") + f"Saved {summary['dir']}")
         if v.get("all_ok") and stats["estimated_missing_camera_frames"] == 0:
             messagebox.showinfo("Recording saved", msg)
         else:
@@ -2175,10 +2423,8 @@ class ZEDTkApp:
     def add_marker(self):
         if self.session is None or not self.engine:
             return
-        with self.engine.latest_lock:
-            fi = dict(self.engine.latest.get("fi") or {})
         text = self.marker_var.get().strip() or "marker"
-        self.session.add_marker(max(0, self.session.frames - 1), fi.get("image_timestamp_ns"), text)
+        self.session.add_marker(text)
         self.marker_var.set("")
         beep_async(1800, 60)
         self._set_status(f"Marker added: {text}")
@@ -2238,6 +2484,10 @@ class ZEDTkApp:
 
     def _poll(self):
         try:
+            if self.engine is not None:
+                self.engine.pump()
+                if self.camera_opened and not self.engine.alive():
+                    self._capture_process_died()
             self._drain_ui_events()
             if self.camera_opened and self.engine:
                 self._refresh_preview_and_stats()
@@ -2376,17 +2626,42 @@ class ZEDTkApp:
             lines.append(f"Missing camera frames {st['estimated_missing_camera_frames']}  "
                          f"SVO status ok/not {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
                          f".mkv backlog {bl}/{bmax} dropped {st['mkv_frames_dropped_backlog']}")
-            if any(w.failed for w in s.writers):
+            if s.writers_failed:
                 lines.append("⚠ an .mkv encoder FAILED – see events.log (SVO2 still recording)")
         elif self.finalizing:
             lines.append("Finalizing files…")
         self.stats_var.set("\n".join(lines))
 
+    def _capture_process_died(self):
+        code = self.engine.proc.exitcode
+        self.engine = None
+        self.session = None
+        self.camera_opened = False
+        self.finalizing = False
+        for w in (self.res_menu, self.fps_menu, self.depth_menu):
+            w.config(state="readonly")
+        self.track_chk.config(state=tk.NORMAL)
+        self.open_cam_btn.config(state=tk.NORMAL)
+        for b in (self.close_cam_btn, self.start_btn, self.stop_btn):
+            b.config(state=tk.DISABLED)
+        keep_system_awake(False)
+        self._set_status(f"⚠ capture process stopped (exit code {code})")
+        messagebox.showerror("Camera", f"The capture process stopped unexpectedly (exit code {code}).\n"
+                                       "Recorded data up to that point is on disk; run verify_session.py.\n"
+                                       "Re-open the camera to continue.")
+
     # ----------------------------------------------------------------- closing
+    def quit_now(self):
+        """Ctrl+C in the terminal: stop + save any recording without asking, then exit."""
+        print("\n[INFO] Ctrl+C - stopping, saving and closing…")
+        self._quitting_without_prompt = True
+        self.on_closing()
+
     def on_closing(self):
         try:
             if self.session is not None:
-                if not messagebox.askyesno("Quit", "Recording in progress. Stop, save and quit?"):
+                if not getattr(self, "_quitting_without_prompt", False) and not messagebox.askyesno(
+                        "Quit", "Recording in progress. Stop, save and quit?"):
                     return
                 self.stop_recording(block=True)
             self._wait_finalize()
@@ -2401,6 +2676,8 @@ def main():
     root = tk.Tk()
     app = ZEDTkApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    # Ctrl+C in the terminal: Python runs this handler at the next GUI poll (<= 50 ms)
+    signal.signal(signal.SIGINT, lambda *_: root.after(0, app.quit_now))
     root.mainloop()
 
 
