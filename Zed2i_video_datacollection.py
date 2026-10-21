@@ -1696,6 +1696,8 @@ def capture_server(conn, status_q, event_q, config: dict) -> None:
     except Exception:
         pass
     CONFIG.update(config)
+    # Status snapshots are disposable: never let unread ones block this process at exit.
+    status_q.cancel_join_thread()
     raise_process_priority()
     zed = sl.Camera()
     ui = queue.Queue()
@@ -1902,9 +1904,14 @@ class RemoteEngine:
     def shutdown(self, tick=None) -> None:
         if self.proc.is_alive():
             self.call("shutdown", timeout=3600, tick=tick)
-        self.proc.join(timeout=30)
+        deadline = time.monotonic() + 30
+        while self.proc.is_alive() and time.monotonic() < deadline:
+            self.pump()            # keep draining so the child can flush and exit
+            self.proc.join(timeout=0.1)
         if self.proc.is_alive():
+            print("[WARN] capture process did not exit; terminating it")
             self.proc.terminate()
+            self.proc.join(timeout=5)
 
 
 class RemoteSession:
