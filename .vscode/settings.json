@@ -1,0 +1,5 @@
+{
+  // pyzed is installed for the system interpreter by the ZED SDK
+  "python.defaultInterpreterPath": "/usr/bin/python3",
+  "files.exclude": { "**/__pycache__": true }
+}

@@ -1,0 +1,46 @@
+{
+  // Terminal > Run Task...  (these do not need the Python debugger extension at all)
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "WeedScan: GUI",
+      "type": "shell",
+      "command": "/usr/bin/python3 Zed2i_video_datacollection.py",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "WeedScan: headless recording",
+      "type": "shell",
+      "command": "/usr/bin/python3 record_headless.py --plot '${input:plot}' --operator '${input:operator}' --height ${input:height} --lock-auto 5",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "WeedScan: doctor (quick check)",
+      "type": "shell",
+      "command": "/usr/bin/python3 zed_doctor.py --quick 2>&1 | grep -v '^\\[20'",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "WeedScan: verify latest session",
+      "type": "shell",
+      "command": "/usr/bin/python3 verify_session.py --latest --svo-full 2>&1 | grep -v '^\\[20'",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "WeedScan: check / fix SSD mount",
+      "type": "shell",
+      "command": "sudo ./jetson/check_ssd.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    { "id": "plot", "type": "promptString", "description": "Plot / row ID", "default": "A1" },
+    { "id": "operator", "type": "promptString", "description": "Operator initials", "default": "" },
+    { "id": "height", "type": "promptString", "description": "Lens height above ground (m)", "default": "1.0" }
+  ]
+}

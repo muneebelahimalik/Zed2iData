@@ -155,7 +155,11 @@ def compare_svo_to_csv(svo_path, csv_ts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("session")
+    ap.add_argument("session", nargs="?",
+                    help="session folder, or a field-day folder together with --latest")
+    ap.add_argument("--latest", action="store_true",
+                    help="check the newest Session_* (in the given folder, or in base_directory "
+                         "from config_local.json)")
     ap.add_argument("--decode", action="store_true")
     ap.add_argument("--checksum", action="store_true")
     ap.add_argument("--check-copy", action="store_true")
@@ -163,6 +167,25 @@ def main():
                     help="decode the whole SVO2 and match every frames.csv timestamp (slow)")
     args = ap.parse_args()
     s = args.session
+    if args.latest:
+        root = s
+        if root is None:
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_local.json"),
+                          encoding="utf-8") as f:
+                    root = json.load(f)["base_directory"]
+            except Exception:
+                sys.exit("--latest without a folder needs base_directory in config_local.json")
+        found = sorted((p for p in (os.path.join(dp, d) for dp, dirs, _ in os.walk(root)
+                                    for d in dirs if d.startswith("Session_"))
+                        if os.path.exists(os.path.join(p, "frames.csv"))),
+                       key=os.path.getmtime)
+        if not found:
+            sys.exit(f"no Session_* folders under {root}")
+        s = found[-1]
+        print(f"latest session: {s}")
+    if s is None:
+        ap.error("give a session folder (or use --latest)")
     rep = {"session": os.path.abspath(s), "checked": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "problems": [], "warnings": []}
     P, W = rep["problems"].append, rep["warnings"].append

@@ -162,3 +162,67 @@ python3 verify_session.py <copy-of-session> --check-copy
 Extraction (NEURAL_PLUS depth, PNGs, point clouds, .mkv rebuild) is best run on the
 lab PC or GPU workstation with `extract_svo.py` (see `DATA_SPEC.md` §8). It also
 works on the Jetson, only slower.
+
+## Running from VS Code
+
+The repo includes `.vscode/` settings, so after opening the folder everything is one
+click away. All of them use the **system `/usr/bin/python3`**, because that is where the
+ZED SDK installed `pyzed`. Do not pick a venv or conda interpreter for this project.
+
+**Option A: VS Code on the Jetson itself (with a monitor)**
+1. Install VS Code for ARM64: download the **.deb (Arm64)** from
+   https://code.visualstudio.com/download, then run `sudo apt install ./code_*_arm64.deb`.
+2. `code ~/Zed2iData` and accept the recommended extensions (Python, Python Debugger).
+3. **Run and Debug** (Ctrl+Shift+D), choose **"WeedScan GUI (VS Code running on the
+   Jetson desktop)"**, and press F5.
+
+**Option B: VS Code on your laptop, connected to the Jetson (Remote-SSH)**
+1. On the laptop install the **Remote - SSH** extension. Then F1, **Remote-SSH: Connect
+   to Host…**, enter `pcp@<jetson-ip>` (find the IP with `hostname -I` on the Jetson), and
+   open `/home/pcp/Zed2iData`.
+2. There are two ways to record from the laptop:
+   * **"Headless recorder (terminal only, works over SSH)"** prompts for plot, operator
+     and height, then records in the VS Code terminal. Type text + Enter for a marker,
+     and `q` + Enter to stop.
+   * **"WeedScan GUI on the Jetson monitor"** opens the GUI window on the screen plugged
+     into the Jetson. You must be logged in there. If it says "couldn't connect to
+     display", run `ls /tmp/.X11-unix` on the Jetson and change `":0"` to `":1"` in
+     `.vscode/launch.json` if you see `X1`.
+
+**Without the debugger:** **Terminal → Run Task…** offers these tasks, which run in the
+terminal and need no Python extension:
+* WeedScan: GUI
+* WeedScan: headless recording
+* WeedScan: doctor (quick check)
+* WeedScan: verify latest session
+* WeedScan: check / fix SSD mount
+
+If the Python Debugger extension refuses Python 3.8 (newer releases may), use these
+tasks instead. They run exactly the same code.
+
+## SSD mount: check and fix
+
+```bash
+sudo ./jetson/check_ssd.sh          # uses base_directory from config_local.json
+```
+
+It checks that:
+* the SSD is visible;
+* `/etc/fstab` has a valid entry with `nofail`, pointing at a disk that exists;
+* the SSD is mounted now (it **mounts it if not**);
+* your user can write to it (it **fixes ownership if not**);
+* systemd will mount it at boot.
+
+It also warns if the desktop has mounted the same SSD a second time under another
+name. After any change, `sudo reboot` and run
+`findmnt /media/pcp/Samsung_980_PRO`, which must show `/dev/nvme0n1p1`.
+
+Typical problems and fixes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| "external drive that is NOT mounted" when starting a recording | SSD not mounted (e.g. after reboot with no fstab entry) | `sudo ./jetson/check_ssd.sh` |
+| fstab entry "does not match any connected disk" | SSD unplugged, or reformatted (new UUID) | reconnect it; or put the new UUID from `sudo blkid` into `/etc/fstab` |
+| mounted but "cannot write" | mount point owned by root | the script `chown`s it to you |
+| Jetson waits ~90 s at boot | fstab line without `nofail` and SSD missing | add `nofail` (setup_jetson.sh `--fstab` lines already have it) |
+| SSD also appears as `/media/pcp/ZED_DATA` | desktop auto-mount by label | harmless; always record to the path in `config_local.json` |
