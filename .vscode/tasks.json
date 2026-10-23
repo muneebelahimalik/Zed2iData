@@ -6,6 +6,7 @@
       "label": "WeedScan: GUI",
       "type": "shell",
       "command": "/usr/bin/python3 Zed2i_video_datacollection.py",
+      "windows": { "command": "python Zed2i_video_datacollection.py" },
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },
@@ -13,6 +14,7 @@
       "label": "WeedScan: headless recording",
       "type": "shell",
       "command": "/usr/bin/python3 record_headless.py --plot '${input:plot}' --operator '${input:operator}' --height ${input:height} --lock-auto 5",
+      "windows": { "command": "python record_headless.py --plot '${input:plot}' --operator '${input:operator}' --height ${input:height} --lock-auto 5" },
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },
@@ -20,6 +22,7 @@
       "label": "WeedScan: doctor (quick check)",
       "type": "shell",
       "command": "/usr/bin/python3 zed_doctor.py --quick 2>&1 | grep -v '^\\[20'",
+      "windows": { "command": "python zed_doctor.py --quick" },
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },
@@ -27,6 +30,7 @@
       "label": "WeedScan: verify latest session",
       "type": "shell",
       "command": "/usr/bin/python3 verify_session.py --latest --svo-full 2>&1 | grep -v '^\\[20'",
+      "windows": { "command": "python verify_session.py --latest --svo-full" },
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },

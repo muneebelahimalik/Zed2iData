@@ -34,7 +34,9 @@ CONF_CODE_NAN = 65535
 
 _NUMERIC_INT = {"rec_frame_idx", "grab_idx", "image_timestamp_ns", "system_time_ns",
                 "est_missing_before", "camera_dropped_total", "svo_frame_ok", "mkv_written",
-                "mkv_frame_idx"}
+                "mkv_frame_idx",
+                # legacy (pre-v2) frames.csv columns
+                "frame_idx", "timestamp_ns", "width", "height"}
 
 
 def _parse_row(r: dict) -> dict:
@@ -134,9 +136,27 @@ class Frame:
         return m
 
 
+def _parse_legacy_calibration(path: str) -> dict:
+    """calibration_params.txt written by the pre-v2 recorder (rectified values, 2 decimals)."""
+    import re
+    txt = open(path, encoding="utf-8").read()
+    left = txt.split("Right Camera")[0]
+    num = lambda key, t: float(re.search(rf"{key}:\s*(-?[\d.]+)", t).group(1))
+    return {"fx": num("fx", left), "fy": num("fy", left), "cx": num("cx", left), "cy": num("cy", left)}
+
+
 class Session:
+    """A recording session folder. Also reads LEGACY sessions made by the pre-v2 recorder
+    (RGB_video.mkv / Depth_video.mkv / session_meta.txt); see DATA_SPEC.md section 13."""
+
     def __init__(self, path: str):
         self.path = path
+        self.legacy = (not os.path.exists(os.path.join(path, "session_metadata.json"))
+                       and os.path.exists(os.path.join(path, "session_meta.txt")))
+        if self.legacy:
+            self._init_legacy(path)
+            return
+        self.rgb_file, self.depth_file, self.conf_file = "RGB_left.mkv", "Depth.mkv", "Confidence.mkv"
         with open(os.path.join(path, "session_metadata.json"), encoding="utf-8") as f:
             self.meta = json.load(f)
         with open(os.path.join(path, "calibration.json"), encoding="utf-8") as f:
@@ -159,6 +179,35 @@ class Session:
         # rows that have a frame in the .mkv files, indexed by mkv_frame_idx
         self.mkv_rows = {r["mkv_frame_idx"]: r for r in self.frames if r.get("mkv_written") == 1}
 
+    def _init_legacy(self, path: str) -> None:
+        self.rgb_file, self.depth_file, self.conf_file = "RGB_video.mkv", "Depth_video.mkv", None
+        meta = {}
+        with open(os.path.join(path, "session_meta.txt"), encoding="utf-8") as f:
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+        self.meta = {"legacy_session_meta": meta, "status": "LEGACY"}
+        self.width, self.height = (int(x) for x in meta["resolution"].split("x"))
+        self.fps = float(meta.get("fps", 15))
+        lc = _parse_legacy_calibration(os.path.join(path, "calibration_params.txt"))
+        self.calib = {"resolution": [self.width, self.height], "fps": self.fps,
+                      "calibration_rectified": {"left_cam": lc}, "legacy": True}
+        self.fx, self.fy, self.cx, self.cy = lc["fx"], lc["fy"], lc["cx"], lc["cy"]
+        self.K = np.array([[self.fx, 0, self.cx], [0, self.fy, self.cy], [0, 0, 1.0]])
+        self.units_per_mm = 1          # legacy depth: whole millimetres (truncated), 0 = invalid
+        self.conf_scale = 100
+        self.frames = []
+        with open(os.path.join(path, "frames.csv"), newline="", encoding="utf-8") as f:
+            for i, r in enumerate(csv.DictReader(f)):
+                row = _parse_row(r)
+                # legacy rows are the frames written to the .mkv files, in order
+                row.update({"rec_frame_idx": i, "mkv_written": 1, "mkv_frame_idx": i,
+                            "image_timestamp_ns": row.get("timestamp_ns"), "grab_idx": row.get("frame_idx")})
+                self.frames.append(row)
+        self.markers = []
+        self.mkv_rows = {r["mkv_frame_idx"]: r for r in self.frames}
+
     def file(self, name: str) -> str:
         return os.path.join(self.path, name)
 
@@ -168,12 +217,12 @@ class Session:
     def iter_frames(self, step: int = 1, start: int = 0, rgb=True, depth=True, confidence=True):
         """Yield Frame objects for .mkv frames start, start+step, ... (mkv_frame_idx)."""
         gens = {}
-        if rgb and self.has("RGB_left.mkv"):
-            gens["rgb"] = read_mkv(self.file("RGB_left.mkv"), self.width, self.height, "bgr", start)
-        if depth and self.has("Depth.mkv"):
-            gens["depth"] = read_mkv(self.file("Depth.mkv"), self.width, self.height, "gray16", start)
-        if confidence and self.has("Confidence.mkv"):
-            gens["conf"] = read_mkv(self.file("Confidence.mkv"), self.width, self.height, "gray16", start)
+        if rgb and self.has(self.rgb_file):
+            gens["rgb"] = read_mkv(self.file(self.rgb_file), self.width, self.height, "bgr", start)
+        if depth and self.has(self.depth_file):
+            gens["depth"] = read_mkv(self.file(self.depth_file), self.width, self.height, "gray16", start)
+        if confidence and self.conf_file and self.has(self.conf_file):
+            gens["conf"] = read_mkv(self.file(self.conf_file), self.width, self.height, "gray16", start)
         if not gens:
             return
         try:

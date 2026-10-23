@@ -375,3 +375,33 @@ for f in s.iter_frames(step=10):                 # f.row = frames.csv row
 ```
 
 Command-line summary of a session: `python session_reader.py <session_folder>`.
+
+## 13. Legacy sessions (recorded with the pre-v2 laptop script)
+
+Recordings made before the v2 recorder have a different layout. You can recognise them by
+a `session_meta.txt` file and **no** `session_metadata.json`. `session_reader.Session`
+detects them automatically (`s.legacy == True`) and gives them the same interface:
+`iter_frames`, `backproject`, `row_by_timestamp`, `mkv_rows`.
+
+| File | Content |
+|---|---|
+| `RGB_video.mkv` | Rectified left image, FFV1. Written as bgr24 and auto-converted by FFmpeg to bgr0, which is lossless. |
+| `Depth_video.mkv` | FFV1 gray16le, depth in **whole millimetres, truncated** (not rounded). **`0` = any invalid pixel** (no match, occluded, too close or too far are all merged). There is no confidence map. |
+| `frames.csv` | `frame_idx, timestamp_ns, system_time_iso, width, height, fps`. **One row per frame actually written to the .mkv files, in order**: row *i* = .mkv frame *i*. `frame_idx` is the capture counter, so jumps in it are frames that were never written. `timestamp_ns` is the ZED hardware image timestamp. |
+| `calibration_params.txt` | Rectified left/right fx, fy, cx, cy (2 decimals), baseline translation and HFOV. Raw calibration was not saved; the factory file for the camera serial can be downloaded from Stereolabs. |
+| `session_meta.txt` | `created`, `resolution: WxH`, `fps`, `depth_mode: NEURAL`, `units: MILLIMETER`. |
+
+Differences that matter for analysis:
+* **Depth has 1 mm steps instead of 0.1 mm.** It was computed with the SDK default
+  confidence threshold (95) and default depth stabilization, so it is temporally
+  smoothed and pre-filtered.
+* **Frames may be missing without any flag.** The old writer dropped frames silently
+  when its queue was full. Find gaps from `timestamp_ns` (dt > 1.5 frame periods) or from
+  jumps in `frame_idx`.
+* **There is no SVO2.** Depth cannot be recomputed, and there are no right images, IMU,
+  pose or camera settings.
+* **The image flip was AUTO.** A downward-looking camera may come out upside down in some
+  sessions. Check a frame and rotate 180° if needed, applying the same rotation to depth.
+* **Camera geometry:** the image may have been rotated 180° (see above). In that case cx
+  and cy refer to the unrotated image: use cx' = W − 1 − cx, cy' = H − 1 − cy after
+  rotating.

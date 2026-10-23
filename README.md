@@ -99,6 +99,32 @@ At 15 fps that is about 17 mm of travel per frame, so each ground point appears 
 about 70 frames. That is plenty of overlap for picking sharp frames and for
 multi-view depth. Moving slower also reduces rolling-shutter shear.
 
+## Windows laptop vs Jetson
+
+The same code runs on both. Each machine gets the latest version only when you update
+it there, with `git pull origin main` in its `Zed2iData` folder. All improvements apply on
+both machines: SVO2 master record, raw 16-bit depth, separate capture process, frame-loss
+checks, verification, Ctrl+C handling and the VS Code configs.
+
+What differs automatically by platform:
+
+| | Windows laptop | Jetson |
+|---|---|---|
+| Default data folder | `M:/Research/Data/...` | from `config_local.json` (the SSD) |
+| Live FFV1 `.mkv` | **on** (needs FFmpeg on PATH) | off (CPU too weak; rebuild offline) |
+| Live depth model | NEURAL | NEURAL_LIGHT |
+| Sounds / keep-awake | winsound / SetThreadExecutionState | aplay / systemd-inhibit |
+| USB 3 link check | not available (use ZED Diagnostic) | `zed_doctor.py` |
+
+Per-machine settings go in a `config_local.json` next to the scripts, so you never edit the
+code. Example for the laptop:
+`{"base_directory": "M:/Research/Data/Vidalia_onions_visit3", "default_record_mkv": true}`
+
+**Benchmark the laptop once**:
+`python zed_doctor.py --bench --out M:/Research/Data --configs HD2K:15:NEURAL:LOSSLESS:mkv,HD2K:15:NEURAL:LOSSLESS`.
+If the `:mkv` run reports dropped .mkv frames or missing camera frames, turn the live
+.mkv off. The SVO2 still holds everything.
+
 ## After each field day
 
 ```

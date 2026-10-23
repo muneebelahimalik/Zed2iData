@@ -106,12 +106,17 @@ def check_python():
 
 def check_tools():
     print("\n== Tools ==")
-    for tool, need, fix in [("ffmpeg", "live .mkv output and extraction", "sudo apt install ffmpeg"),
-                            ("ffprobe", "verification", "sudo apt install ffmpeg")]:
+    ff_fix = ("install FFmpeg (e.g. `winget install Gyan.FFmpeg`) and reopen the terminal"
+              if IS_WINDOWS else "sudo apt install ffmpeg")
+    for tool, need, fix in [("ffmpeg", "live .mkv output and extraction", ff_fix),
+                            ("ffprobe", "verification", ff_fix)]:
         if shutil.which(tool):
             report("OK", tool, shutil.which(tool))
         else:
             report("WARN", f"{tool} missing ({need})", fix=fix)
+    if IS_WINDOWS:
+        report("OK", "sound", "Windows winsound")
+        return
     if any(shutil.which(p) for p in ("paplay", "aplay", "ffplay")):
         report("OK", "sound player", next(p for p in ("paplay", "aplay", "ffplay") if shutil.which(p)))
     else:
@@ -124,6 +129,10 @@ def check_tools():
 
 def check_usb():
     print("\n== ZED 2i USB connection ==")
+    if not os.path.isdir("/sys/bus/usb/devices"):
+        report("INFO", "USB link speed check is Linux-only",
+               "on Windows: plug the ZED into a blue USB 3 port; ZED Diagnostic shows the link")
+        return
     devs = []
     for dev in glob.glob("/sys/bus/usb/devices/*"):
         if read(os.path.join(dev, "idVendor")) != "2b03":

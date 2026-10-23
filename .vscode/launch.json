@@ -1,7 +1,8 @@
 {
   // Run / debug WeedScan from VS Code (Run and Debug panel, or F5).
-  // All configs use the SYSTEM python3, because that is where the ZED SDK installed pyzed.
-  // Do not select a venv/conda interpreter for this project.
+  // Jetson/Linux: the SYSTEM /usr/bin/python3 (where the ZED SDK installed pyzed).
+  // Windows laptop: the interpreter selected in VS Code (bottom-right) - pick the one where
+  // `import pyzed.sl` works (the one you ran get_python_api.py with).
   "version": "0.2.0",
   "configurations": [
     {
@@ -9,6 +10,7 @@
       "type": "debugpy",
       "request": "launch",
       "python": "/usr/bin/python3",
+      "windows": { "python": "${command:python.interpreterPath}" },
       "program": "${workspaceFolder}/Zed2i_video_datacollection.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
@@ -19,6 +21,7 @@
       "type": "debugpy",
       "request": "launch",
       "python": "/usr/bin/python3",
+      "windows": { "python": "${command:python.interpreterPath}" },
       "program": "${workspaceFolder}/Zed2i_video_datacollection.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
@@ -32,6 +35,7 @@
       "type": "debugpy",
       "request": "launch",
       "python": "/usr/bin/python3",
+      "windows": { "python": "${command:python.interpreterPath}" },
       "program": "${workspaceFolder}/record_headless.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
@@ -43,6 +47,7 @@
       "type": "debugpy",
       "request": "launch",
       "python": "/usr/bin/python3",
+      "windows": { "python": "${command:python.interpreterPath}" },
       "program": "${workspaceFolder}/zed_doctor.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
