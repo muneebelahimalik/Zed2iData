@@ -109,6 +109,10 @@ CONFIG = {
     # Preview / UI.
     "preview_max_width": 1400,
     "preview_interval_s": 0.10,
+    # When the GUI is shown on another computer over SSH (X11 forwarding) every preview
+    # image crosses the network: draw a smaller preview less often there.
+    "remote_preview_max_width": 900,
+    "remote_preview_interval_s": 0.4,
     "gui_poll_ms": 50,
     "camera_settings_poll_frames": 3,   # one setting per poll, round-robin (5 settings)
     "csv_flush_interval_s": 1.0,
@@ -2188,6 +2192,8 @@ class ZEDTkApp:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         rw, rh = RES_SIZES.get(res_name, (1920, 1080))
         CONFIG["preview_max_width"] = int(max(480, min(1400, sw - 40, (sh - 700) * 2 * rw / rh)))
+        if display_is_remote():
+            CONFIG["preview_max_width"] = min(CONFIG["preview_max_width"], CONFIG["remote_preview_max_width"])
 
         self.engine = RemoteEngine(self.ui_events)
         res = self.engine.call("open", res_name, fps, depth_choice, tracking, timeout=3600,
@@ -2679,8 +2685,38 @@ class ZEDTkApp:
             self.root.destroy()
 
 
+def display_is_remote() -> bool:
+    """True when the GUI is drawn on another machine (SSH X11 forwarding)."""
+    disp = os.environ.get("DISPLAY", "")
+    host = disp.split(":")[0]
+    return bool(os.environ.get("SSH_CONNECTION")) and host not in ("", "unix")
+
+
+NO_DISPLAY_HELP = """
+No display available for the GUI (you are probably connected over SSH without X11 forwarding).
+
+  * GUI on your laptop: connect with X11 forwarding, e.g. MobaXterm (SSH session, X11 on by
+    default) or VS Code Remote-SSH with "ForwardX11 yes" + VcXsrv running on Windows.
+    Then `echo $DISPLAY` must print something like localhost:10.0.  See JETSON.md.
+  * Or record without a GUI:
+      python3 record_headless.py --plot A1 --operator MM --height 0.855 --exposure 4 --gain 60
+"""
+
+
 def main():
-    root = tk.Tk()
+    if not IS_WINDOWS and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print(NO_DISPLAY_HELP)
+        sys.exit(2)
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print(f"Cannot open a window: {e}\n{NO_DISPLAY_HELP}")
+        sys.exit(2)
+    if display_is_remote():
+        CONFIG["preview_interval_s"] = max(CONFIG["preview_interval_s"], CONFIG["remote_preview_interval_s"])
+        print(f"[INFO] remote display {os.environ.get('DISPLAY')}: preview reduced to "
+              f"~{1 / CONFIG['preview_interval_s']:.1f} fps, max {CONFIG['remote_preview_max_width']} px wide "
+              f"(recording is not affected)")
     app = ZEDTkApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     # Ctrl+C in the terminal: Python runs this handler at the next GUI poll (<= 50 ms)

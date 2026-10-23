@@ -233,3 +233,38 @@ Typical problems and fixes:
 | mounted but "cannot write" | mount point owned by root | the script `chown`s it to you |
 | Jetson waits ~90 s at boot | fstab line without `nofail` and SSD missing | add `nofail` (setup_jetson.sh `--fstab` lines already have it) |
 | SSD also appears as `/media/pcp/ZED_DATA` | desktop auto-mount by label | harmless; always record to the path in `config_local.json` |
+
+## Jetson without a monitor: GUI on your Windows laptop (X11 forwarding)
+
+The GUI runs on the Jetson and its window is drawn on the laptop. The app detects this
+and sends a smaller preview (≤ 900 px wide, about 2.5 fps) to keep the network light.
+Recording is not affected, because the camera runs in its own process. If the connection
+drops, the recording is stopped and saved.
+
+**Easiest: MobaXterm** (free, has a built-in X server)
+1. Install MobaXterm. Choose **Session → SSH**, enter the Jetson IP, user `pcp`, and
+   leave *X11-Forwarding* ticked (the default).
+2. In its terminal: `cd ~/Zed2iData && python3 Zed2i_video_datacollection.py`
+
+**From VS Code (Remote-SSH)**
+1. Install **VcXsrv** on Windows and run XLaunch: *Multiple windows*, display number
+   **0**, *Start no client*, and tick **Disable access control**.
+2. Laptop file `C:\Users\<you>\.ssh\config`:
+   ```
+   Host jetson
+     HostName <jetson-ip>
+     User pcp
+     ForwardX11 yes
+     ForwardX11Trusted yes
+     Compression yes
+   ```
+3. Set the Windows user environment variable `DISPLAY` = `localhost:0.0`, then restart VS
+   Code completely and connect to **jetson**.
+4. In the VS Code terminal, `echo $DISPLAY` must print e.g. `localhost:10.0`. Then run
+   `python3 Zed2i_video_datacollection.py`.
+   If `$DISPLAY` is empty, check that VcXsrv is running and that VS Code's setting
+   *Remote.SSH: Enable X11 Forwarding* is on, then reconnect.
+
+Without forwarding the app prints these instructions instead of a traceback. You can
+always record without a GUI with `record_headless.py`.
+
