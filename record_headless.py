@@ -53,6 +53,9 @@ def parse_args():
     ap.add_argument("--operator", default="")
     ap.add_argument("--crop-stage", default="")
     ap.add_argument("--travel-direction", default="image top = forward")
+    ap.add_argument("--robot-offset", type=float,
+                    default=(float(CONFIG["default_robot_offset_m"]) if CONFIG["default_robot_offset_m"] != "" else None),
+                    help="distance (m) along travel from the Delta robot axis to the camera optical centre")
     ap.add_argument("--weather", default="")
     ap.add_argument("--notes", default="")
     ap.add_argument("--height", type=float, default=CONFIG["default_camera_height_m"],
@@ -122,6 +125,7 @@ def main():
 
     field = {"site": a.site, "plot_id": a.plot, "operator": a.operator, "crop_stage": a.crop_stage,
              "travel_direction": a.travel_direction, "weather": a.weather, "notes": a.notes,
+             "robot_offset_m": a.robot_offset,
              "camera_height_m": a.height, "plant_height_m": a.plant_height,
              "target_speed_m_s": a.target_speed, "travel_axis": "Image vertical (rows)",
              "recorded_with": "record_headless.py"}

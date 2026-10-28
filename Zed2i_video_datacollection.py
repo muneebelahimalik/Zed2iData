@@ -123,6 +123,9 @@ CONFIG = {
     "default_blur_px": 1.0,
     "default_min_views": 20,
     "default_beep_spacing_m": 0.5,
+    # Look-ahead mount: distance along the travel direction from the Delta robot's axis
+    # to the camera's optical centre (m). Saved with every session (field.robot_offset_m).
+    "default_robot_offset_m": "",
 }
 
 
@@ -2081,6 +2084,7 @@ class ZEDTkApp:
         fields = [("site", "Site / field", ""), ("plot_id", "Plot / row ID", ""),
                   ("operator", "Operator", ""), ("crop_stage", "Crop stage / DAP", ""),
                   ("travel_direction", "Travel direction", "image top = forward"),
+                  ("robot_offset_m", "Camera ahead of robot (m)", str(CONFIG["default_robot_offset_m"])),
                   ("weather", "Weather / light", ""), ("notes", "Notes", "")]
         for i, (k, label, default) in enumerate(fields, start=1):
             ttk.Label(fld, text=label).grid(row=i, column=0, sticky="w")
@@ -2310,6 +2314,7 @@ class ZEDTkApp:
     # --------------------------------------------------------------- recording
     def _collect_field_info(self) -> dict:
         info = {k: v.get().strip() for k, v in self.field_vars.items()}
+        info["robot_offset_m"] = safe(lambda: float(info.get("robot_offset_m")), info.get("robot_offset_m"))
         for k, var in (("camera_height_m", self.h_var), ("plant_height_m", self.plant_var),
                        ("target_speed_m_s", self.target_speed_var)):
             info[k] = safe(lambda: float(var.get()), var.get())
