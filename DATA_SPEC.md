@@ -289,16 +289,7 @@ distance Z is `Z / fx` mm per pixel, about 0.94 mm/px at 1 m for HD2K
   "start row 3", "weed patch", "skip: person in view"). Use them to split or label
   sequences.
 * **`session_metadata.json`:**
-  * `field`: site, plot_id, operator, crop_stage, travel_direction, weather, notes, camera_height_m, plant_height_m, target_speed_m_s, travel_axis, **robot_offset_m**
-  * `field.robot_offset_m` is the **look-ahead mount** offset: the distance along the travel
-    direction from the Delta X robot axis to the camera's optical centre. The camera sits on
-    the robot's centreline, ahead of it, pointing straight down, with its image long side
-    across the row and image top = forward. A point at camera coordinates (X, Y, Z) in mm
-    (x right, y down the image, z down to the ground) is then **(robot_offset_m·1000 − Y)
-    mm ahead of the robot axis** and X mm across the row from the centreline, at Z below
-    the lens. Image-bottom points (Y > 0) are the ones closest to the robot. Track the
-    vehicle's motion with the per-frame pose (or wheel odometry) until that distance is
-    inside the Ø800 workspace; do not assume constant speed.
+  * `field`: site, plot_id, operator, crop_stage, travel_direction, weather, notes, camera_height_m, plant_height_m, target_speed_m_s, travel_axis
   * `camera`: serial number, model, firmware, resolution, fps
   * `camera_settings_at_start`
   * `capture`: resolution, fps, depth_mode, positional_tracking, record_svo / record_mkv, svo_compression, `init_parameters`, `runtime_parameters`
