@@ -1414,6 +1414,16 @@ class CaptureEngine(threading.Thread):
             safe(lambda: self._read_sensors(fi))
             steps["sensors"] = time.perf_counter() - t0
 
+            # Preview first: it fills fi["center_depth_mm"], which on_frame() writes to frames.csv
+            t0 = time.perf_counter()
+            if want_preview and bgra is not None:
+                self.last_preview = time.monotonic()
+                self._update_preview(bgra, depth, fi)
+            else:
+                with self.latest_lock:
+                    self.latest["fi"] = fi
+            steps["preview"] = time.perf_counter() - t0
+
             t0 = time.perf_counter()
             if recording:
                 s = self.session
@@ -1432,15 +1442,6 @@ class CaptureEngine(threading.Thread):
                     bgra_c = depth_c = conf_c = None
                 s.on_frame(fi, bgra_c, depth_c, conf_c, self.period_ms)
             steps["record"] = time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            if want_preview and bgra is not None:
-                self.last_preview = time.monotonic()
-                self._update_preview(bgra, depth, fi)
-            else:
-                with self.latest_lock:
-                    self.latest["fi"] = fi
-            steps["preview"] = time.perf_counter() - t0
             self._note_step_times(steps)
             self.grab_idx += 1
 
