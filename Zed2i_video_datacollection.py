@@ -1175,6 +1175,11 @@ class CaptureEngine(threading.Thread):
         self.duplicate_frames = 0
         self.step_max = {}
         self.slow_steps = collections.Counter()
+        # motion-safe auto exposure (see _cmd_motion_safe)
+        self.ms = None
+        self.ms_status = ""
+        self.ms_last_adjust = 0.0
+        self.last_brightness = None
         self.prev_image_mat = sl.Mat()
         self.prev_depth_mat = sl.Mat()
         scale = min(1.0, (CONFIG["preview_max_width"] / 2) / max(1, width))
@@ -1259,6 +1264,62 @@ class CaptureEngine(threading.Thread):
             self.zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE, wb)
         self._poll_camera_settings()
         return True, f"locked exposure={exp}%, gain={gain}, WB={wb} K"
+
+    def _cmd_motion_safe(self, enabled, cap_pct=None, target=110):
+        """Auto exposure that never exceeds a motion-blur limit.
+
+        The ZED's own auto exposure brightens by lengthening the exposure first (up to the
+        whole frame period, ~61 ms at 15 fps), which smears the image when the camera moves.
+        This controller keeps exposure <= cap_pct (computed from walking speed and blur
+        budget) and makes up the rest with gain; when bright it lowers gain first, then
+        exposure. Brightness = mean of the preview image (0..255), target ~110.
+        """
+        if not enabled:
+            self.ms = None
+            self.ms_status = ""
+            return True, "motion-safe exposure off"
+        cap = int(max(1, min(100, math.floor(float(cap_pct)))))
+        self._poll_camera_settings()
+        exp = self.cam_settings.get("exposure_pct") or cap
+        gain = self.cam_settings.get("gain")
+        exp = int(min(cap, max(1, exp)))
+        gain = int(gain if gain is not None else 50)
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, exp)   # also turns AEC off
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, gain)
+        self.ms = {"cap": cap, "target": float(target), "exp": exp, "gain": gain}
+        self.ms_last_adjust = time.monotonic()
+        self._poll_camera_settings()
+        return True, (f"motion-safe exposure ON: max {cap}% (≈{cap / 100.0 * self.period_ms:.1f} ms), "
+                      f"gain adjusts automatically")
+
+    def _motion_safe_step(self) -> None:
+        ms, b = self.ms, self.last_brightness
+        now = time.monotonic()
+        if ms is None or b is None or now - self.ms_last_adjust < 0.4:
+            return
+        self.ms_last_adjust = now
+        err = ms["target"] - b
+        exp, gain = ms["exp"], ms["gain"]
+        warn = ""
+        if err > 10:                                  # too dark
+            if exp < ms["cap"]:
+                exp += 1                              # longer exposure first (less noise) ...
+            elif gain < 100:
+                gain = min(100, gain + int(min(10, max(1, round(err * 0.3)))))   # ... then gain
+            else:
+                warn = "  ⚠ too dark at max gain: slow down, add light or allow more blur"
+        elif err < -10:                               # too bright
+            if gain > 0:
+                gain = max(0, gain - int(min(10, max(1, round(-err * 0.3)))))
+            elif exp > 1:
+                exp -= 1
+        if exp != ms["exp"]:
+            self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, int(exp))
+        if gain != ms["gain"]:
+            self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, int(gain))
+        ms["exp"], ms["gain"] = exp, gain
+        self.ms_status = (f"motion-safe: exp {exp}% (≈{exp / 100.0 * self.period_ms:.1f} ms, max {ms['cap']}%) "
+                          f"gain {gain} brightness {b:.0f}/{ms['target']:.0f}{warn}")
 
     def _cmd_reset_tracking(self):
         if self.tracking_enabled:
@@ -1423,6 +1484,10 @@ class CaptureEngine(threading.Thread):
                 with self.latest_lock:
                     self.latest["fi"] = fi
             steps["preview"] = time.perf_counter() - t0
+            if self.ms is not None:
+                t0 = time.perf_counter()
+                safe(self._motion_safe_step)
+                steps["exposure_ctl"] = time.perf_counter() - t0
 
             t0 = time.perf_counter()
             if recording:
@@ -1489,6 +1554,8 @@ class CaptureEngine(threading.Thread):
             if c.size:
                 center_depth = float(np.median(c))
         fi["center_depth_mm"] = center_depth
+        self.last_brightness = float(cv2.cvtColor(np.ascontiguousarray(rgb_small[:, :, :3]),
+                                                  cv2.COLOR_BGR2GRAY).mean())
         avg_grab = (sum(self.grab_times) / len(self.grab_times) * 1000) if self.grab_times else None
         with self.latest_lock:
             self.latest = {"rgb": rgb_small, "depth": depth_small, "fi": fi,
@@ -1819,7 +1886,8 @@ def capture_server(conn, status_q, event_q, config: dict) -> None:
             with eng.latest_lock:
                 latest = dict(eng.latest)
             snap = {"fi": latest.get("fi"), "grab_ms": latest.get("grab_ms"),
-                    "current_fps": latest.get("current_fps"), "cam_settings": dict(eng.cam_settings)}
+                    "current_fps": latest.get("current_fps"), "cam_settings": dict(eng.cam_settings),
+                    "ms_status": eng.ms_status}
             rgb = latest.get("rgb")
             if rgb is not None and rgb is not last_preview:
                 last_preview = rgb
@@ -1855,6 +1923,7 @@ class RemoteEngine:
         self.latest = {}
         self.cam_settings = {}
         self.session_status = None
+        self.ms_status = ""
         self.width = self.height = self.fps = None
         self.depth_enabled = False
 
@@ -1899,6 +1968,7 @@ class RemoteEngine:
                 for k in ("fi", "grab_ms", "current_fps"):
                     self.latest[k] = snap.get(k)
             self.cam_settings = snap.get("cam_settings") or self.cam_settings
+            self.ms_status = snap.get("ms_status", "")
             self.session_status = snap.get("session")
         while True:
             try:
@@ -2070,6 +2140,12 @@ class ZEDTkApp:
             row=2, column=0, columnspan=2, sticky="we", pady=(4, 0))
         ttk.Button(ex, text="Lock current auto values", command=self._lock_current).grid(
             row=2, column=2, columnspan=2, sticky="we", pady=(4, 0), padx=(6, 0))
+        self.ms_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ex, text="Motion-safe auto: limit exposure for the blur budget at the target "
+                                 "speed (sec. 4), auto gain", variable=self.ms_var,
+                        command=self._apply_motion_safe).grid(row=3, column=0, columnspan=4, sticky="w",
+                                                              pady=(4, 0))
+        self._ms_cap_sent = None
 
         # --- field info
         fld = ttk.LabelFrame(left, text="3. Field / session info (saved with data)", padding=5)
@@ -2250,7 +2326,55 @@ class ZEDTkApp:
             messagebox.showwarning("Camera setting", str(msg))
         return ok, msg
 
+    def _motion_safe_cap(self):
+        """Longest exposure (in % of the frame period) for <= blur budget at the target speed."""
+        if not self.cam_info or not self.engine or not self.engine.fps:
+            return None
+        try:
+            h = float(self.h_var.get())
+            ph = float(self.plant_var.get())
+            blur = float(self.blur_var.get())
+            v = float(self.target_speed_var.get())
+        except ValueError:
+            return None
+        if v <= 0:
+            return 100.0, 1000.0 / self.engine.fps
+        lc = self.cam_info["calibration_rectified"]["left_cam"]
+        f = lc["fy"] if self.axis_var.get().startswith("Image vertical") else lc["fx"]
+        gsd_near_mm = max(0.05, h - ph) * 1000.0 / f
+        t_ms = blur * gsd_near_mm / v                     # (m/s == mm/ms)
+        period_ms = 1000.0 / self.engine.fps
+        return min(100.0, t_ms / period_ms * 100.0), t_ms
+
+    def _ms_off(self):
+        if self.ms_var.get():
+            self.ms_var.set(False)
+            if self.engine:
+                self.engine.submit("motion_safe", False)
+            self._ms_cap_sent = None
+
+    def _apply_motion_safe(self):
+        if not self.engine:
+            self.ms_var.set(False)
+            return
+        if not self.ms_var.get():
+            self._engine_cmd("motion_safe", False)
+            self._ms_cap_sent = None
+            return
+        cap = self._motion_safe_cap()
+        if cap is None:
+            self.ms_var.set(False)
+            messagebox.showerror("Motion-safe exposure", "Fill in height, plant height, blur and target speed "
+                                                         "(section 4) first.")
+            return
+        res = self._engine_cmd("motion_safe", True, cap[0], 110)
+        if res and res[0]:
+            self.auto_exp_var.set(False)
+            self._ms_cap_sent = int(cap[0])
+            self._set_status(res[1] + f" for ≤{self.blur_var.get()} px at {self.target_speed_var.get()} m/s")
+
     def _apply_auto_exposure(self):
+        self._ms_off()
         if self.engine:
             self._engine_cmd("set_setting", "AEC_AGC", 1 if self.auto_exp_var.get() else 0)
             if not self.auto_exp_var.get():
@@ -2263,6 +2387,7 @@ class ZEDTkApp:
     def _apply_manual_exposure(self):
         if not self.engine:
             return
+        self._ms_off()
         try:
             exp = int(float(self.exp_var.get()))
             gain = int(float(self.gain_var.get()))
@@ -2276,6 +2401,7 @@ class ZEDTkApp:
     def _lock_current(self):
         if not self.engine:
             return
+        self._ms_off()
         res = self._engine_cmd("lock_current")
         if res and res[0]:
             self.auto_exp_var.set(False)
@@ -2584,6 +2710,12 @@ class ZEDTkApp:
             self.speed_var.set("Speed: – (tracking off / initialising)")
             self.speed_label.configure(foreground="black")
 
+        # --- motion-safe exposure: follow changes of target speed / blur budget / height
+        if self.ms_var.get():
+            cap = self._motion_safe_cap()
+            if cap is not None and int(cap[0]) != self._ms_cap_sent:
+                self._apply_motion_safe()
+
         # --- pace beep
         now = time.monotonic()
         if rec and self.beep_var.get() and target:
@@ -2610,6 +2742,8 @@ class ZEDTkApp:
             f"Camera fps {latest.get('current_fps') or 0:5.1f}  grab {latest.get('grab_ms') or 0:5.1f} ms | "
             f"exp {cs.get('exposure_pct')}% (≈{cs.get('exposure_ms_approx') or 0:.1f} ms) gain {cs.get('gain')} "
             f"WB {cs.get('wb_temp_k')}K {'AUTO' if cs.get('aec_agc') else 'MANUAL'}")
+        if getattr(self.engine, "ms_status", ""):
+            lines.append(self.engine.ms_status)
         lines.append(f"Tilt from nadir {tilt:.1f}°" if tilt is not None else "Tilt –")
         if cd:
             lines[-1] += f" | centre depth {cd / 1000:.3f} m"

@@ -77,6 +77,20 @@ Data-safety features:
   .mkv and record SVO2 only (about 120 MB/s). You can rebuild the .mkv files later
   with `extract_svo.py --mkv`.
 
+### Golden hour, shade, low sun: use **Motion-safe auto** exposure
+The ZED's own auto exposure brightens by **lengthening the exposure** first, up to about
+61 ms at 15 fps, and that smears the image when the camera moves. Tick **Motion-safe
+auto** in the GUI (section 2), or pass `record_headless.py --motion-safe
+--target-speed 0.12`. It keeps the exposure at or below the longest value that gives
+≤ the blur budget (section 4, default 1 px) at your **target speed**, and raises or
+lowers **gain** automatically to hold brightness. In bright light it also shortens the
+exposure. The stats line shows `motion-safe: exp …% gain … brightness …`.
+* `⚠ too dark at max gain`: walk slower (set a lower target speed, which allows a longer
+  exposure), add light, or accept more blur.
+* Keep the live `BLUR ≈ … px` at ≤ 1–2 px.
+* A diffuse, **flicker-free** LED light near the camera lets the camera use less gain
+  (less noise) and fills in low-sun shadows.
+
 ### Travel speed
 
 Motion blur, not overlap, sets the speed limit. The *Speed planner* panel works this

@@ -45,6 +45,10 @@ def parse_args():
     ap.add_argument("--no-mkv", dest="mkv", action="store_false")
     ap.add_argument("--exposure", type=int, help="manual exposure %% (0-100 of frame period)")
     ap.add_argument("--gain", type=int, help="manual gain 0-100 (with --exposure)")
+    ap.add_argument("--motion-safe", action="store_true",
+                    help="auto exposure that never exceeds the blur budget at --target-speed "
+                         "(longest exposure for <= --blur-px, gain adjusts automatically)")
+    ap.add_argument("--blur-px", type=float, default=1.0, help="blur budget for --motion-safe")
     ap.add_argument("--lock-auto", type=float, default=0,
                     help="let auto exposure/WB settle N seconds, then lock them")
     ap.add_argument("--duration", type=float, default=0, help="stop automatically after N seconds")
@@ -102,6 +106,14 @@ def main():
         engine.submit("set_setting", "EXPOSURE", max(0, min(100, a.exposure)))
         if a.gain is not None:
             engine.submit("set_setting", "GAIN", max(0, min(100, a.gain)))
+    elif a.motion_safe:
+        lc0 = cam_info["calibration_rectified"]["left_cam"]
+        gsd_near_mm = max(0.05, a.height - a.plant_height) * 1000.0 / lc0["fy"]
+        t_ms = a.blur_px * gsd_near_mm / max(1e-3, a.target_speed)
+        cap_pct = min(100.0, t_ms / (1000.0 / open_params["fps"]) * 100.0)
+        print(engine.submit("motion_safe", True, cap_pct, 110)[1],
+              f"for <= {a.blur_px} px at {a.target_speed} m/s")
+        time.sleep(3.0)  # let gain settle
     elif a.lock_auto > 0:
         print(f"Letting auto exposure settle {a.lock_auto:.0f} s…")
         time.sleep(a.lock_auto)
@@ -193,7 +205,12 @@ def main():
         bl, bmax = session.backlog()
         spd = fi.get("speed_m_s")
         tilt = fi.get("tilt_from_nadir_deg")
-        line = (f"\r{time.monotonic() - t_start:7.1f}s  frames {st['frames_grabbed']:6d}  "
+        ms_txt = ""
+        if engine.ms_status:
+            ms_txt = engine.ms_status.split("  ⚠")[0].replace("motion-safe: ", "") + "  "
+            if "⚠" in engine.ms_status:
+                ms_txt += "TOO DARK (add light / slow down)  "
+        line = (f"\r{time.monotonic() - t_start:7.1f}s  frames {st['frames_grabbed']:6d}  " + ms_txt +
                 f"missing {st['estimated_missing_camera_frames']:3d}  "
                 f"SVO status ok/not {st['svo_frames_ok']}/{st['svo_frames_failed']}  "
                 + (f"mkv backlog {bl}/{bmax} drop {st['mkv_frames_dropped_backlog']}  " if session.writers else "")
