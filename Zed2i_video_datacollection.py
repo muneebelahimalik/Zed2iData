@@ -2569,8 +2569,16 @@ class ZEDTkApp:
                 colour = "#C62828"
             elif target and abs(speed - target) > 0.25 * target:
                 colour = "#EF6C00"
+            blur_txt = ""
+            if plan:
+                # live motion blur at the plant tops: distance moved during one exposure / mm per px
+                blur_px = speed * plan["exposure_ms"] / plan["gsd_near_mm_per_px"]
+                blur_txt = f"   BLUR ≈ {blur_px:.1f} px"
+                if blur_px > 2.0:
+                    colour = "#C62828"
+                    blur_txt += "  ⚠ too blurry: slow down / shorter exposure / more light"
             self.speed_var.set(f"Speed: {speed:.2f} m/s (target {target or 0:.2f}, max {vmax or 0:.2f})"
-                               f"   distance {fi.get('distance_m', 0) or 0:.2f} m")
+                               f"   distance {fi.get('distance_m', 0) or 0:.2f} m" + blur_txt)
             self.speed_label.configure(foreground=colour)
         else:
             self.speed_var.set("Speed: – (tracking off / initialising)")

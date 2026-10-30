@@ -12,6 +12,9 @@ Examples
   # one frame every 50 mm of travel (uses positional tracking), plus float depth + PLY
   python extract_svo.py rec.svo2 --out ex --every-mm 50 --float-depth --ply
 
+  # motion-blurred recording: keep only the sharpest frame of every 15 (1 per second)
+  python extract_svo.py rec.svo2 --out sharp --sharpest-per 15
+
   # rebuild the full RGB/Depth/Confidence .mkv set without any dropped frames
   python extract_svo.py rec.svo2 --out rebuilt --mkv --no-png
 
@@ -59,6 +62,51 @@ def write_ply(path, xyz, bgr):
         f.write(rec.tobytes())
 
 
+def score_sharpness(svo_path, start=0, end=-1):
+    """{svo_frame: (sharpness, timestamp_ns)} for every frame. Fast: no depth, half resolution.
+
+    Sharpness = variance of the Laplacian of the grey image: blurred frames have weak edges
+    and score low. Only compare scores within one recording (it depends on the scene).
+    """
+    ip = sl.InitParameters()
+    ip.set_from_svo_file(os.path.abspath(svo_path))
+    ip.svo_real_time_mode = False
+    ip.depth_mode = sl.DEPTH_MODE.NONE
+    safe(lambda: setattr(ip, "camera_image_flip", sl.FLIP_MODE.OFF))
+    cam = sl.Camera()
+    if cam.open(ip) != sl.ERROR_CODE.SUCCESS:
+        sys.exit(f"Cannot open {svo_path} for sharpness scoring")
+    res = cam.get_camera_information().camera_configuration.resolution
+    half = sl.Resolution(res.width // 2, res.height // 2)
+    n = cam.get_svo_number_of_frames()
+    rt = sl.RuntimeParameters()
+    rt.enable_depth = False
+    mat = sl.Mat()
+    if start > 0:
+        cam.set_svo_position(start)
+    out = {}
+    t0 = time.time()
+    while True:
+        err = cam.grab(rt)
+        if err != sl.ERROR_CODE.SUCCESS:
+            if err_is(err, "END_OF_SVOFILE_REACHED") or len(out) >= n:
+                break
+            continue
+        fno = cam.get_svo_position()
+        if end >= 0 and fno > end:
+            break
+        cam.retrieve_image(mat, sl.VIEW.LEFT, sl.MEM.CPU, half)
+        grey = cv2.cvtColor(mat.get_data(), cv2.COLOR_BGRA2GRAY)
+        out[fno] = (float(cv2.Laplacian(grey, cv2.CV_64F).var()),
+                    cam.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds())
+        if len(out) % 500 == 0:
+            print(f"  scored {len(out)}/{n} frames ({len(out) / (time.time() - t0):.0f}/s)")
+        if len(out) >= n:
+            break
+    cam.close()
+    return out
+
+
 def ffv1_proc(path, w, h, fps, in_fmt, out_fmt):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-f", "rawvideo",
            "-pix_fmt", in_fmt, "-s", f"{w}x{h}", "-framerate", str(fps), "-i", "pipe:0",
@@ -76,6 +124,11 @@ def main():
     ap.add_argument("--step", type=int, default=1, help="keep every Nth frame")
     ap.add_argument("--every-mm", type=float, default=0,
                     help="keep one frame per this much camera travel (needs tracking)")
+    ap.add_argument("--sharpest-per", type=int, default=0, metavar="N",
+                    help="score every frame's sharpness and keep only the sharpest frame in each "
+                         "block of N consecutive frames (e.g. 15 = sharpest frame per second)")
+    ap.add_argument("--min-sharpness", type=float, default=0,
+                    help="with --sharpest-per: skip a block whose best frame is below this score")
     ap.add_argument("--start", type=int, default=0, help="first SVO frame")
     ap.add_argument("--end", type=int, default=-1, help="last SVO frame (inclusive)")
     ap.add_argument("--right", action="store_true", help="also save the rectified right image")
@@ -109,7 +162,7 @@ def main():
         sys.exit(f"Cannot open {args.svo}: {err}")
 
     tracking = False
-    if depth_on:
+    if depth_on and not args.sharpest_per:  # sharpest-per seeks frames; poses come from frames.csv
         tp = sl.PositionalTrackingParameters()
         safe(lambda: setattr(tp, "enable_imu_fusion", True))
         safe(lambda: setattr(tp, "set_gravity_as_origin", True))
@@ -160,22 +213,50 @@ def main():
             procs["depth"] = ffv1_proc(os.path.join(args.out, "Depth.mkv"), w, h, fps, "gray16le", "gray16le")
             procs["conf"] = ffv1_proc(os.path.join(args.out, "Confidence.mkv"), w, h, fps, "gray16le", "gray16le")
 
+    sharp = {}
+    chosen = None
+    if args.sharpest_per:
+        sharp = score_sharpness(args.svo, args.start, args.end)
+        with open(os.path.join(args.out, "sharpness.csv"), "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(["svo_frame", "timestamp_ns", "sharpness"])
+            for fno in sorted(sharp):
+                wr.writerow([fno, sharp[fno][1], f"{sharp[fno][0]:.2f}"])
+        chosen = []
+        frames_sorted = sorted(sharp)
+        for i in range(0, len(frames_sorted), args.sharpest_per):
+            block = frames_sorted[i:i + args.sharpest_per]
+            best = max(block, key=lambda k: sharp[k][0])
+            if sharp[best][0] >= args.min_sharpness:
+                chosen.append(best)
+        vals = sorted(v[0] for v in sharp.values())
+        print(f"sharpness of {len(vals)} frames: min {vals[0]:.1f}, median {vals[len(vals) // 2]:.1f}, "
+              f"max {vals[-1]:.1f}; keeping {len(chosen)} frames (sharpest of every {args.sharpest_per})")
+        params["sharpness"] = {"frames_scored": len(vals), "median": vals[len(vals) // 2],
+                               "kept": len(chosen), "metric": "variance of Laplacian, left image at 1/2 res"}
+
     left, right, depth, conf, xyz = sl.Mat(), sl.Mat(), sl.Mat(), sl.Mat(), sl.Mat()
     left_raw, right_raw = sl.Mat(), sl.Mat()
     pose = sl.Pose()
-    if args.start > 0:
+    if args.start > 0 and chosen is None:
         zed.set_svo_position(args.start)
+    seek = list(chosen) if chosen is not None else None
 
     idx_f = open(os.path.join(args.out, "index.csv"), "w", newline="", encoding="utf-8")
     idx = csv.writer(idx_f)
     idx.writerow(["out_idx", "svo_frame", "timestamp_ns", "pose_state", "tx_mm", "ty_mm", "tz_mm",
-                  "qx", "qy", "qz", "qw", "distance_mm", "file_stem"])
+                  "qx", "qy", "qz", "qw", "distance_mm", "file_stem", "sharpness"])
     last_kept_pos = None
     dist_mm = 0.0
     prev_pos = None
     out_idx = 0
     t0 = time.time()
     while True:
+        if seek is not None:          # --sharpest-per: jump straight to each chosen frame
+            if not seek:
+                break
+            target = seek.pop(0)
+            zed.set_svo_position(target)
         err = zed.grab(rt)
         if err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
             break
@@ -203,6 +284,10 @@ def main():
                 prev_pos = pos
 
         keep = ((fno - args.start) % max(1, args.step) == 0)
+        if seek is not None:
+            keep = fno == target
+            if not keep:
+                print(f"[WARN] asked for frame {target}, SDK returned {fno}; skipped")
         if args.every_mm > 0:
             keep = pos is not None and (last_kept_pos is None or dist_mm - last_kept_pos >= args.every_mm)
             if keep:
@@ -251,7 +336,8 @@ def main():
                 procs["depth"].stdin.write(d16.tobytes())
                 procs["conf"].stdin.write(c16.tobytes())
 
-        idx.writerow([out_idx, fno, ts, pstate, *t, *q, f"{dist_mm:.1f}", stem])
+        idx.writerow([out_idx, fno, ts, pstate, *t, *q, f"{dist_mm:.1f}", stem,
+                      f"{sharp[fno][0]:.2f}" if fno in sharp else ""])
         out_idx += 1
         if out_idx % 50 == 0:
             el = time.time() - t0

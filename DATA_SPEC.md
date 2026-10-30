@@ -275,6 +275,12 @@ distance Z is `Z / fx` mm per pixel, about 0.94 mm/px at 1 m for HD2K
   | `index.csv` | `out_idx, svo_frame, timestamp_ns, pose_state, tx..qw, distance_mm, file_stem` |
   | `calibration.json`, `extraction_params.json` | intrinsics, and the exact arguments, depth mode and SDK version used |
 
+  `--sharpest-per N` scores every frame (variance of the Laplacian, left image at half
+  resolution) and keeps only the **sharpest frame in each block of N**. All scores go to
+  `sharpness.csv` (`svo_frame, timestamp_ns, sharpness`), and `index.csv` gets a
+  `sharpness` column. Scores are only comparable within one recording. In this mode
+  extraction seeks directly to the chosen frames, so the pose columns of `index.csv` are
+  empty. Take poses from the recording's `frames.csv` by timestamp instead.
   Useful options: `--depth-mode NEURAL_PLUS` (default), `--step N` (every Nth frame),
   `--every-mm D` (one frame per D mm of travel), `--start`, `--end`.
 * **The tracking world frame in `index.csv` is not the same as in `frames.csv`.**
